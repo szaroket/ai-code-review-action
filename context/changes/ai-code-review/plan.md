@@ -1058,11 +1058,11 @@ keep it cheap.
 
 #### Automated
 
-- [x] 4.1 `uv run python -c "from pr_review_agent.agents_context import build_system_prompt, load_review_criteria, load_rules_file, load_lessons_file"` works
+- [x] 4.1 `uv run python -c "from pr_review_agent.agents_context import build_system_prompt, load_review_criteria, load_rules_file, load_lessons_file"` works — c895155
 
 #### Manual
 
-- [x] 4.2 Criteria-file guard smoke test per Testing Strategy step 6 (malformed file → exit `3`)
+- [x] 4.2 Criteria-file guard smoke test per Testing Strategy step 6 (malformed file → exit `3`) — c895155
 
 ### Phase 5: review_agent.py (the actual agent loop)
 
