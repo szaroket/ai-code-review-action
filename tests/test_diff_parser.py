@@ -2,7 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from pr_review_agent.diff_parser import ChangedFile, build_diff_context, parse_diff
+from pr_review_agent.diff_parser import (
+    ChangedFile,
+    build_diff_context,
+    exclude_paths,
+    parse_diff,
+)
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "sample.diff"
 
@@ -104,3 +109,78 @@ def test_build_diff_context_over_budget_drops_whole_files(
     assert sample_files[0].hunks_text in text
     # A later file's hunk text was dropped wholesale.
     assert sample_files[-1].hunks_text not in text
+
+
+def _stub_file(path: str, hunk_size: int) -> ChangedFile:
+    return ChangedFile(
+        path=path,
+        is_added=False,
+        is_removed=False,
+        is_renamed=False,
+        source_path=None,
+        hunks_text="x" * hunk_size,
+    )
+
+
+def test_build_diff_context_stops_at_first_over_budget_file() -> None:
+    """A file that busts the budget stops packing — it does not skip ahead."""
+    files = [_stub_file("big.py", 500), _stub_file("small.py", 10)]
+    file_list_len = len("Changed files:\nbig.py\nsmall.py\n\n")
+
+    text, was_truncated = build_diff_context(files, max_chars=file_list_len + 200)
+
+    assert was_truncated
+    # Neither block fits/is packed: big.py busts the budget and small.py, though
+    # it would fit in the leftover space, is lower priority and must not jump it.
+    assert files[0].hunks_text not in text
+    assert files[1].hunks_text not in text
+
+
+def test_build_diff_context_never_exceeds_max_chars_on_huge_file_list() -> None:
+    """The changed-file list is trimmed too, so max_chars is a real ceiling."""
+    files = [_stub_file(f"src/module_{i:03d}.py", 10) for i in range(200)]
+
+    text, was_truncated = build_diff_context(files, max_chars=300)
+
+    assert was_truncated
+    assert len(text) <= 300
+    assert "more file(s)" in text
+
+
+def test_exclude_paths_without_globs_keeps_everything(
+    sample_files: list[ChangedFile],
+) -> None:
+    assert exclude_paths(sample_files, None) == sample_files
+    assert exclude_paths(sample_files, []) == sample_files
+
+
+def test_exclude_paths_filters_by_glob(sample_files: list[ChangedFile]) -> None:
+    kept = exclude_paths(sample_files, ["*.png"])
+    assert "image.png" not in {f.path for f in kept}
+    assert len(kept) == len(sample_files) - 1
+
+
+def test_exclude_paths_matches_across_directory_separators() -> None:
+    """`*` crosses `/`, so `docs/*` excludes nested paths too."""
+    files = [
+        _stub_file("docs/guide/intro.md", 5),
+        _stub_file("src/main.py", 5),
+    ]
+    kept = exclude_paths(files, ["docs/*"])
+    assert [f.path for f in kept] == ["src/main.py"]
+
+
+def test_build_diff_context_renders_rename_direction() -> None:
+    """The header must show old -> new, not new -> old."""
+    renamed = ChangedFile(
+        path="new_name.py",
+        is_added=False,
+        is_removed=False,
+        is_renamed=True,
+        source_path="old_name.py",
+        hunks_text="@@ -1 +1 @@\n",
+    )
+
+    text, _ = build_diff_context([renamed], max_chars=100_000)
+
+    assert "File: old_name.py -> new_name.py (renamed)" in text
