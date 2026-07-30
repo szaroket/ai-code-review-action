@@ -920,7 +920,7 @@ keep it cheap.
 
 #### Manual
 
-- [ ] 3.1 Verified manually against a real PR in this repo (throwaway PR if none exists yet); `find_repo_root()` returns the checkout root and degrades to `cwd` with a warning outside a git checkout
+- [x] 3.1 Verified manually against a real PR in this repo (throwaway PR if none exists yet); `find_repo_root()` returns the checkout root and degrades to `cwd` with a warning outside a git checkout
 
 ### Phase 4: agents_context.py
 

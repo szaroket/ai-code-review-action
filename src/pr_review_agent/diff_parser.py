@@ -1,9 +1,12 @@
 """Unified-diff parsing: turn `gh pr diff --patch` output into changed-lines models."""
 
+import logging
 from dataclasses import dataclass, field
 
 import unidiff
 from unidiff.patch import PatchedFile
+
+logger = logging.getLogger(__name__)
 
 _BINARY_PLACEHOLDER = "[binary file, diff not shown]"
 
@@ -32,6 +35,7 @@ def _changed_file_from_patched_file(patched_file: PatchedFile) -> ChangedFile:
     )
 
     if patched_file.is_binary_file:
+        logger.debug("Binary file diff detected: %s", patched_file.path)
         return ChangedFile(
             path=patched_file.path,
             is_added=patched_file.is_added_file,
@@ -82,7 +86,11 @@ def parse_diff(diff_text: str) -> list[ChangedFile]:
         unified diff.
     """
     patch_set = unidiff.PatchSet(diff_text)
-    return [_changed_file_from_patched_file(patched_file) for patched_file in patch_set]
+    changed_files = [
+        _changed_file_from_patched_file(patched_file) for patched_file in patch_set
+    ]
+    logger.info("Parsed %d changed file(s) from diff", len(changed_files))
+    return changed_files
 
 
 def _file_header(changed_file: ChangedFile) -> str:
@@ -125,8 +133,21 @@ def build_diff_context(files: list[ChangedFile], max_chars: int) -> tuple[str, b
         block = _file_block(changed_file)
         if running_len + len(block) > max_chars:
             was_truncated = True
+            logger.debug(
+                "Dropping %s from diff context to stay under max_chars=%d",
+                changed_file.path,
+                max_chars,
+            )
             continue
         kept_blocks.append(block)
         running_len += len(block)
+
+    if was_truncated:
+        logger.warning(
+            "Diff context truncated: kept %d of %d file(s) under max_chars=%d",
+            len(kept_blocks),
+            len(files),
+            max_chars,
+        )
 
     return file_list_text + "".join(kept_blocks), was_truncated
