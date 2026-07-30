@@ -914,7 +914,7 @@ keep it cheap.
 
 #### Automated
 
-- [x] 2.1 `uv run pytest tests/test_diff_parser.py -v` passes
+- [x] 2.1 `uv run pytest tests/test_diff_parser.py -v` passes — 6e76704
 
 ### Phase 3: github_diff.py
 
