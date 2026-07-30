@@ -1034,7 +1034,7 @@ keep it cheap.
 #### Automated
 
 - [x] 1.1 `uv run python -c "from pr_review_agent.models import Finding, ReviewOutput, Criterion, CriterionScore, ReviewVerdict"` works — 1271954
-- [x] 1.2 Skipped by user decision (2026-07-30): `tests/test_models.py` removed, no dedicated tests for `models.py` — supersedes the phase text's StrEnum-pinning rationale
+- [x] 1.2 Skipped by user decision (2026-07-30): `tests/test_models.py` removed, no dedicated tests for `models.py` — supersedes the phase text's StrEnum-pinning rationale — 07f9a59
 
 ### Phase 2: diff_parser.py + tests
 
@@ -1047,7 +1047,7 @@ keep it cheap.
 #### Automated
 
 - [x] 3.2 `uv run pytest tests/test_github_diff.py -v` passes (`resolve_repo` precedence + slug validation)
-- [x] 3.3 Skipped by user decision (2026-07-30): no dedicated tests for `logging_config.py`, superseding impl-review F5's "wanted" note and `follow-ups/review-fixes.md`'s open item
+- [x] 3.3 Skipped by user decision (2026-07-30): no dedicated tests for `logging_config.py`, superseding impl-review F5's "wanted" note and `follow-ups/review-fixes.md`'s open item — 07f9a59
 
 #### Manual
 

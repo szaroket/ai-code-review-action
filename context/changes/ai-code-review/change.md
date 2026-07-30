@@ -76,3 +76,10 @@ Quality gates were pulled forward from Phase 9 (F9): `ruff` and `pyright` are
 now installed and configured, and pyright has run for the first time.
 Gate state at end of triage: ruff ✅ · ruff format ✅ · pyright ✅ 0 errors ·
 pytest ✅ 26 passed · pre-commit ✅ 7 hooks.
+
+**Phase 3 closed out (2026-07-30, user decision).** F5's queued redaction
+tests were dropped: no `tests/test_logging_config.py` was written, and
+`tests/test_models.py` (Phase 1's StrEnum-pinning tests) was removed too.
+Progress 1.2 and 3.3 marked done-by-decision — 07f9a59. All Phase 1-3
+Progress items are now checked; remaining gate state: ruff ✅ · ruff format ✅
+· pyright ✅ 0 errors · pytest ✅ 22 passed, 1 skipped.
