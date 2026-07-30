@@ -65,10 +65,10 @@ itself.
 - No `README.md`, `pyproject.toml`, `.python-version`,
   `.pre-commit-config.yaml`, `src/`, or `.github/workflows/` yet — this is a
   genuinely fresh repo for all of that.
-- `gh` CLI is installed and authenticated in this environment — **verified
-  directly here, in this repo**: `gh --version` → `2.93.0`, `gh auth status`
-  → logged in to github.com as `szaroket` with `repo` scope. Authentication
-  is machine-wide, so it works against whatever `--repo`/`repo:` is passed.
+- `gh` CLI is installed and authenticated in this environment (`gh 2.93.0`,
+  logged in as `szaroket` with `repo` scope). **No longer a runtime
+  dependency** since the transport moved to `githubkit` — but still the
+  easiest way to mint a local token: `export GH_TOKEN=$(gh auth token)`.
 - Prior research: `context/changes/ai-code-review/first-research.md`
   (moved into this repo along with this plan) verified the relevant Claude
   Agent SDK facts against official docs — `query()`/`ClaudeSDKClient`,
@@ -78,12 +78,14 @@ itself.
   GitHub reviews POST payload shape (`{path, line, side, body}`) the
   `Finding` model is built to match. These facts are about the SDK and the
   GitHub API only — no repo-specific content — so they carry over unchanged.
-- Confirmed behavior of the `gh`/git toolchain (observed live during earlier
-  research): `gh pr diff --patch` on a PR with binary assets emits `GIT
-  binary patch` blocks, not the friendlier `Binary files ... differ` summary
-  — `diff_parser.py` must handle this defensively (Phase 2). Phase 2's
-  fixture reproducing this is **hand-authored in this repo**, never copied
-  from another repository's history.
+- Confirmed behavior of GitHub's patch output (observed live during earlier
+  research): a PR with binary assets emits `GIT binary patch` blocks, not the
+  friendlier `Binary files ... differ` summary — `diff_parser.py` must handle
+  this defensively (Phase 2). This is a property of the patch format itself,
+  so it held when the transport moved from `gh pr diff --patch` to the
+  `application/vnd.github.diff` media type. Phase 2's fixture reproducing it
+  is **hand-authored in this repo**, never copied from another repository's
+  history.
 - **What did *not* carry over, because it was repo-specific content baked
   into code:** the earlier plan's `build_review_checklist` distilled the
   origin repo's `AGENTS.md` into hardcoded named categories ("Backend
@@ -161,12 +163,36 @@ criterion here waits on it or references it.
   default `false`). Rejected: env-var auto-enable (implicit), folding into
   `format` (conflates a side-effect-free artifact with an action that
   mutates a real PR).
-- **Post method:** `gh api repos/{owner}/{repo}/pulls/{pr}/reviews --method
-  POST` with `{event, body, comments: [{path, line, side, body}]}` — gives
-  real per-line inline comments anchored to the diff (the whole point).
-  Rejected: `gh pr review --body <summary>` (loses inline anchoring), a raw
-  HTTP call via a new dependency (no benefit over `gh api`, which already
-  handles auth).
+- **GitHub transport: `githubkit`, not the `gh` CLI.** *(Decision reversed
+  during the Phase 0-3 impl review — the original plan specified a subprocess
+  wrapper around `gh`, and Phase 3 was first implemented that way.)* Rationale
+  for the reversal: three of the impl review's findings (no subprocess
+  timeout, locale-not-UTF-8 decoding, unguarded `json.loads` on CLI stdout)
+  were all artifacts of the subprocess boundary rather than of the problem
+  being solved. `githubkit` is generated from GitHub's OpenAPI spec and is
+  fully typed, so it pays for itself under Phase 9's `pyright` gate; it
+  carries its own HTTP timeout; and it removes the "is `gh` installed and
+  authenticated" failure class entirely.
+  - The **diff** is fetched as the raw patch via
+    `GET /repos/{owner}/{repo}/pulls/{n}` with
+    `Accept: application/vnd.github.diff` (githubkit's public
+    `GitHub.request`, not a private requester). Deliberately **not** built
+    from `pulls.list_files`, whose per-file `patch` field GitHub omits for
+    large files and caps at 3000 entries — silently, exactly where a review
+    matters most.
+  - **Path exclusion moves client-side.** The REST API has no equivalent of
+    `gh pr diff -e <glob>`, so `diff_parser.exclude_paths(files, globs)`
+    filters after parsing. `get_pr_diff` no longer takes `exclude_globs`.
+  - **Cost accepted:** local runs now need `GH_TOKEN`/`GITHUB_TOKEN` in the
+    environment (`export GH_TOKEN=$(gh auth token)`), where the `gh` CLI
+    previously reused an interactive `gh auth login` session.
+  - `git` **stays** on subprocess for `find_repo_root` and `origin`-remote
+    detection — that is local VCS state, not a GitHub API concern.
+- **Post method:** `pulls.create_review` with
+  `{event, body, comments: [{path, line, side, body}]}` — gives real per-line
+  inline comments anchored to the diff (the whole point). Rejected:
+  `gh pr review --body <summary>` (loses inline anchoring), and a
+  summary-only comment.
 - **Auth tokens are consumer-supplied inputs**, not hardcoded: `anthropic-
   api-key` and `github-token` inputs, mapped to `ANTHROPIC_API_KEY`/
   `GH_TOKEN` env vars for the underlying `gh`/SDK calls. A consuming
@@ -234,10 +260,17 @@ criterion here waits on it or references it.
   — this action is consumed via `uses: szaroket/ai-code-review-action@ref`
   by repos this user controls, not published for public discovery yet. Pick
   a license before any public Marketplace listing.
-- No `git push`/tagging as part of this plan's execution — pushing and
-  release-tagging are explicit, deliberate steps the user takes when ready
-  (this repo already has a real `origin` remote, so pushing has real,
-  visible effects), not automated by any phase here.
+- No **release tagging** as part of this plan's execution — cutting a `@v1`
+  (or any tag consumers can reference) is an explicit, deliberate step the
+  user takes when ready, not automated by any phase here.
+  *(Narrowed during the Phase 0-3 impl review, F10: this originally read "no
+  `git push`/tagging", which contradicted Phase 3's own verification step —
+  verifying against a real PR in this repo is impossible without pushing a
+  branch. The implementer followed the phase; the guardrail was wrong.)*
+  **Verification pushes are expected**: feature branches and throwaway PRs
+  opened to exercise a phase are part of the work. What stays off-limits is
+  anything a consumer could pin to — tags, releases, and Marketplace
+  listings.
 - No consumer-side workflow wiring as part of this plan — adopting the
   action is a downstream step each consuming repo takes in its *own*
   repository, after this one is tagged.
@@ -255,16 +288,20 @@ ai-code-review-action/              (this repo's root — the action itself)
   action.yml                        # composite action definition (Phase 10)
   src/pr_review_agent/
     __init__.py
+    py.typed                        # PEP 561 marker — this package ships types
     cli.py                          # argparse, orchestration, exit codes
-    github_diff.py                  # subprocess wrapper around `gh` CLI
+    logging_config.py               # stderr logging, UTC, secret redaction (Phase 3)
+    github_diff.py                  # githubkit client: PR metadata + raw diff
     diff_parser.py                  # unified diff -> changed-lines model
     agents_context.py               # loads rules/lessons/criteria files, builds system prompt
     review_agent.py                 # ClaudeAgentOptions, @tool, query() loop
     models.py                       # Finding / ReviewOutput / Criterion / ReviewVerdict
     output.py                       # console + JSON + markdown writers
-    github_publish.py               # real PR-review posting via `gh api ...reviews`
+    github_publish.py               # real PR-review posting via pulls.create_review
   tests/
     test_diff_parser.py
+    test_logging_config.py          # redaction filter + traceback path (Phase 3)
+    test_github_diff.py             # mocked subprocess: argv, error branches (Phase 3)
     test_cli.py                     # scope-filter unit tests
     test_output.py
     fixtures/sample.diff
@@ -328,23 +365,42 @@ This is the one phase that's about the repo, not the tool.
 
 ## Phase 1: models.py
 
-Everything else depends on this. Frozen `Finding` dataclass (`path`, `line`,
-`side: Literal["LEFT","RIGHT"]`, `severity: Literal["blocker","warning","nit"]`,
+Everything else depends on this.
+
+**Closed value sets are `StrEnum`, not `Literal`.** *(The plan originally
+specified `Literal[...]`; commit `4972799` refactored to enums and the impl
+review confirmed the change is correct and better.)* Four enums —
+`DiffSide` (`LEFT`/`RIGHT`), `Severity` (`blocker`/`warning`/`nit`),
+`CriterionResult` (`pass`/`fail`/`not_applicable`), `ReviewEvent`
+(`APPROVE`/`REQUEST_CHANGES`/`COMMENT`). Each member's value is the exact
+wire string, character-for-character.
+
+**`StrEnum` specifically, and that is load-bearing.** Because `StrEnum`
+members *are* `str`, `json.dumps(asdict(finding))` emits `"RIGHT"`, not
+`"DiffSide.RIGHT"` — so Phase 6's `write_json` and Phase 7's POST payload
+need no `.value` calls anywhere. Downgrading these to a plain `enum.Enum`
+would break both phases **silently**, with no type error. Phase 1's tests
+pin this by serializing, not by comment.
+
+Enums also give Phase 5's `@tool` handler free validation with a usable
+message (`DiffSide("bogus")` raises `ValueError`), and a single shared
+`ReviewEvent` structurally guarantees that `ReviewVerdict.overall_verdict`
+and `ReviewOutput.event` cannot drift apart — which two separate `Literal`s
+could not.
+
+Frozen `Finding` (`path`, `line`, `side: DiffSide`, `severity: Severity`,
 `comment`, `rule_reference: str | None`).
 
 Frozen `Criterion` (`name`, `description`) — one per entry loaded from the
 consumer's `criteria-file`; frozen `CriterionScore` (`name`,
-`score: Literal["pass","fail","not_applicable"]`, `rationale`); frozen
-`ReviewVerdict` (`criteria: list[CriterionScore]`,
-`overall_verdict: Literal["APPROVE","REQUEST_CHANGES","COMMENT"]` — same
-casing as `ReviewOutput.event`, no translation needed).
+`score: CriterionResult`, `rationale`); frozen `ReviewVerdict`
+(`criteria: list[CriterionScore]`, `overall_verdict: ReviewEvent`).
 
-Mutable `ReviewOutput` (`pr_number`,
-`event: Literal["COMMENT","REQUEST_CHANGES","APPROVE"]`, `summary_body`,
+Mutable `ReviewOutput` (`pr_number`, `event: ReviewEvent`, `summary_body`,
 `comments: list[Finding]`, `verdict: ReviewVerdict | None` — `None` on the
 exit-`5` path, where Phase 8 builds and writes `ReviewOutput` *before* the
 verdict check so the agent's findings survive; `event` then falls back to
-`"COMMENT"` per Phase 6).
+`ReviewEvent.COMMENT` per Phase 6).
 
 No pydantic — small, no network/DB boundary needing coercion. No validation
 here; validation happens once at the `@tool` handler boundary in Phase 5.
@@ -364,7 +420,7 @@ dependency.
   by dropping whole low-priority files, never mid-file; always keep the
   full file list.
 - **Binary-diff handling:** `GIT binary patch` blocks (confirmed live
-  format from `gh pr diff --patch`) must not crash the parse. Catch the
+  format from GitHub's raw patch output) must not crash the parse. Catch the
   binary case per-file and emit a `ChangedFile` with empty line-number
   lists and `hunks_text = "[binary file, diff not shown]"`.
 
@@ -380,31 +436,71 @@ whole files (not partial) and still lists all filenames.
 
 Verify: `uv run pytest tests/test_diff_parser.py -v`.
 
-## Phase 3: github_diff.py
+## Phase 3: github_diff.py + logging_config.py
 
-Plain code, no agent. `GhCommandError(RuntimeError)`; `PullRequestMetadata`
-dataclass; `get_pr_metadata(pr_number, repo=None)` via `gh pr view --json
-number,title,url,baseRefName,headRefName,files`; `get_pr_diff(pr_number,
-repo=None, exclude_globs=None)` via `gh pr diff --patch [-e glob ...]`.
-Differentiate error causes: `gh` not on `PATH` vs not authenticated vs PR
-not found. `-R/--repo` only added when `repo` is provided — this is now
-*always* meaningfully used, since every consuming repo is a different
-`--repo` (no more "usually the same repo" assumption).
+**`logging_config.py` ships alongside** (added during implementation, recorded
+here after the fact — see the Phase 0-3 impl review). It exists because every
+module from Phase 3 onward needs a log channel that cannot pollute stdout, and
+because token redaction has to be in place *before* the first subprocess error
+message is rendered. Contract: a single `StreamHandler` on
+`ext://sys.stderr`; UTC timestamps; a module-level `redact(text)` shared by
+the log filter, the formatters' `formatException`, and `github_diff.py`'s
+error paths; `configure_logging(verbose: bool)` — the exact hook Phase 5's
+`--verbose` flag calls — and **nothing configured at import time**. Every
+module uses `logging.getLogger(__name__)`; no `print()` anywhere in `src/`.
+Log format is deliberately not configurable: `--format {console,json,markdown}`
+in Phase 8 governs *review output*, not logs.
 
-**`find_repo_root() -> Path` lives here** (this module already owns the
-subprocess-wrapper role). Implementation: `git rev-parse --show-toplevel`,
-run with `cwd=Path.cwd()`, output stripped and wrapped in `Path`. It is
-load-bearing in three places — Phase 5's `ClaudeAgentOptions(cwd=...)`,
-Phase 5's repo-mismatch guard (`gh repo view` runs in this directory), and
-Phase 10's `--project`-not-`--directory` invariant, where every relative
-path (`--rules-file`, `--criteria-file`, `--lessons-file`) must resolve
-against the caller's checkout.
+`py.typed` is added in the same phase so consumers and `pyright` see this
+package as typed.
+
+Plain code, no agent. `GitHubApiError(RuntimeError)`; `PullRequestMetadata`
+dataclass; `resolve_repo(repo=None) -> tuple[str, str]`;
+`get_pr_metadata(pr_number, repo=None)` via `pulls.get` + paginated
+`pulls.list_files`; `get_pr_diff(pr_number, repo=None)` via the raw-patch
+media type (see "GitHub transport" under Key Decisions).
+
+**Repository resolution** replaces `gh`'s `-R/--repo`: explicit argument →
+`GITHUB_REPOSITORY` (always set by Actions) → the `origin` remote of the
+local checkout. A malformed explicit slug is rejected with
+`GitHubApiError`; a malformed `GITHUB_REPOSITORY` falls through to
+autodetection rather than being fatal. The slug regex also serves as the
+input validation the impl review flagged as cheap insurance against a
+hostile `repo` input redirecting the review at a different repository.
+
+**Error mapping** replaces the CLI's stderr sniffing with HTTP status:
+401/403 → token rejected (with the permissions hint), 404 → PR not found,
+other non-2xx → status + redacted body, `RequestTimeout` → timeout message,
+`RequestError` → network error. All are `GitHubApiError`, which Phase 8 maps
+to exit `2`.
+
+**TLS**: the client is built with `truststore` so it trusts the **OS**
+certificate store rather than `certifi`. Without this, corporate proxies and
+antivirus TLS interception break the tool on developer machines — verified
+here: AVG Antivirus on the dev machine both MITMs the connection (certifi
+rejects its root) and exports `SSLKEYLOGFILE` pointing at a device path,
+which crashes CPython's OpenSSL on Windows (`no OPENSSL_Applink`).
+`_build_ssl_context` therefore also suppresses `SSLKEYLOGFILE` while
+building the context — independently correct, since a process holding GitHub
+tokens and an Anthropic API key must not write TLS session keys to disk.
+**This applies to the Anthropic SDK in Phase 5 too**, which uses `httpx` over
+the same stdlib `ssl`.
+
+**`find_repo_root() -> Path` lives here** (this module owns the local-VCS
+subprocess role). Implementation: `git rev-parse --show-toplevel` through a
+shared `_git_output` helper — explicit `timeout`, `encoding="utf-8"`, and
+`errors="replace"`, returning `None` on every failure mode rather than
+raising. It is load-bearing in three places — Phase 5's
+`ClaudeAgentOptions(cwd=...)`, Phase 5's repo-mismatch guard, and Phase 10's
+`--project`-not-`--directory` invariant, where every relative path
+(`--rules-file`, `--criteria-file`, `--lessons-file`) must resolve against
+the caller's checkout.
 
 Failure behavior: if `git` is absent or the cwd isn't a git checkout, log a
 warning to stderr and **fall back to `Path.cwd()`** rather than raising —
-the tool can still review a diff fetched via `gh` without a local checkout,
-it just loses repo exploration (the mismatch guard above will disable
-Read/Grep/Glob anyway, since `gh repo view` fails in the same conditions).
+the tool can still review a diff fetched over the API without a local
+checkout, it just loses repo exploration (the mismatch guard above will
+disable Read/Grep/Glob anyway, since it fails in the same conditions).
 No new exit code; this is a degradation, not a hard failure.
 
 Verify: manually against a real PR in **this** repo (open a throwaway PR
@@ -475,12 +571,12 @@ Adds `claude-agent-sdk` dependency.
   reviews its own PR. When they diverge, Read/Grep/Glob would silently
   browse a *different codebase* than the one under review, either finding
   nothing or (worse) citing same-named files with different contents in
-  `rule_reference`. So `cli.py` compares `--repo` against the local
-  checkout's origin (`gh repo view --json nameWithOwner`, run in
+  `rule_reference`. So `cli.py` compares the resolved `--repo` against the
+  local checkout's `origin` remote (reusing Phase 3's `_git_output`, run in
   `repo_root`); **on mismatch it drops `Read`/`Grep`/`Glob` from
   `allowed_tools` for that run** — degrading to a diff-only review — and
   emits a loud stderr warning naming both repos and stating that repo
-  exploration is disabled. A missing/failed `gh repo view` (no origin, not a
+  exploration is disabled. An undeterminable origin (no remote, not a
   checkout) is treated as a mismatch: exploration off, warning emitted.
 - `async for message in query(...)`: log assistant text at `--verbose` to
   stderr (keep stdout clean); capture the final `ResultMessage`'s status.
@@ -527,16 +623,18 @@ cap, summary, verdict→event passthrough).
 
 ## Phase 7: github_publish.py (real PR-comment posting)
 
-Plain code, no agent — mirrors `github_diff.py`'s subprocess-wrapper style.
-`GhPublishError(RuntimeError)` (distinct from `GhCommandError`).
+Plain code, no agent — mirrors `github_diff.py`'s githubkit-client style and
+reuses its `resolve_repo`, `_client`, and error-mapping helpers.
+`GitHubPublishError(RuntimeError)` (distinct from `GitHubApiError`).
 `post_review(pr_number, review_output, repo=None) -> None`: serializes to
 **exactly** `{"event", "body", "comments": [...]}` — strips the local-only
 `criteria` key that `write_json` includes, since GitHub's reviews endpoint
 has no schema slot for it, and relies on `body` already containing the
 rendered criteria section (built once in `build_summary`, reused here) —
-and pipes the result via `gh api repos/{owner}/{repo}/pulls/{pr}/reviews
---method POST --input -`. `-R/--repo` only added when provided. Raise
-`GhPublishError` with the real `gh` stderr on any non-zero exit.
+and posts it via `pulls.create_review(owner, repo, pr_number, data=...)`.
+Raise `GitHubPublishError` with the mapped HTTP status and redacted response
+body on failure; a 403 here almost always means the fork-token limitation
+documented under Key Decisions, so say so in the message.
 
 Verify: manually, by publishing a real review to a scratch/test PR (see
 Testing Strategy) — no live-API mocking this iteration.
@@ -570,7 +668,7 @@ scope. Unit tested in `tests/test_cli.py`.
 
 `main_async` orchestration, exit-code contract:
 
-1. Fetch metadata+diff; `GhCommandError` → stderr message, exit `2`.
+1. Fetch metadata+diff; `GitHubApiError` → stderr message, exit `2`.
 2. **Zero-changed-files guard**: no changed files at all → print "nothing
    to review", exit `0` without invoking the agent.
 3. Load `--rules-file`, `--lessons-file` (if given), `--criteria-file`.
@@ -600,7 +698,7 @@ scope. Unit tested in `tests/test_cli.py`.
    and markdown output carry an explicit `"=== INCOMPLETE — NO VERDICT
    PRODUCED ==="` banner. **Never publish on this path**, regardless of
    `--publish`.
-9. If `--publish`: call `github_publish.post_review(...)`. `GhPublishError`
+9. If `--publish`: call `github_publish.post_review(...)`. `GitHubPublishError`
    → stderr message noting local artifacts are saved, exit `6`. On success,
    console confirms "Posted N inline comments to PR #<n>" (no dry-run
    banner).
@@ -614,21 +712,41 @@ or `exclude` list anymore — every consumer sets its own.
 
 ## Phase 9: final pyproject.toml
 
-`requires-python = ">=3.13"`; deps `claude-agent-sdk`, `unidiff` (let `uv
-add` resolve real current versions); `[project.scripts] pr-review-agent =
+`requires-python = ">=3.13"`; deps `claude-agent-sdk`, `unidiff`,
+`githubkit`, `truststore` (let `uv add` resolve real current versions); `[project.scripts] pr-review-agent =
 "pr_review_agent.cli:main"`; `[build-system]` hatchling +
-`[tool.hatch.build.targets.wheel] packages = ["src/pr_review_agent"]`; dev
-group `pytest` only; ruff `extend-select = ["D"]`, `ignore = ["D1"]`,
-pydocstyle `convention = "google"`; pyright `include = ["src"]`,
-`typeCheckingMode = "basic"`.
+`[tool.hatch.build.targets.wheel] packages = ["src/pr_review_agent"]`.
+
+**Tooling config was pulled forward into Phase 0-3** during the impl review
+(F9), because "the gates exist" and "the gates pass" are different claims and
+only the second is worth anything: `ruff check` and `pyright` were not
+installed, so neither had ever run against this code. Current state, all
+green: dev group is `pytest`, `ruff`, `pyright`; ruff `extend-select = ["D"]`
+with **`ignore = ["D107", "D105"]`, not `["D1"]`** — the originally planned
+blanket `D1` would have disabled precisely the missing-docstring rules that
+enforce this project's own docstring rule; pydocstyle
+`convention = "google"`; `per-file-ignores` waives `D100`/`D103` for
+`tests/*`; pyright `include = ["src"]`, `typeCheckingMode = "basic"`.
+
+Three things worth knowing for anyone re-running these:
+- **Ruff's `D1xx` does not cover underscore-prefixed functions.** Private
+  helpers need their docstrings written by hand; the linter will never flag
+  a missing one.
+- `unidiff` must be imported from `unidiff.constants` / `unidiff.patch`, not
+  the package root — the root re-exports without declaring public, which
+  pyright rejects as `reportPrivateImportUsage`.
+- `pyright` bootstraps Node via `nodeenv`, so it needs working TLS; if it
+  dies with `no OPENSSL_Applink`, see the `SSLKEYLOGFILE` note in Phase 3.
 
 **Commit `uv.lock`.** `.gitignore` leaves it commented out (i.e. not
 ignored), which is correct and must stay that way. For a published action
 the lock file is what makes `uv sync --project "${{ github.action_path }}"`
 reproducible at a given tag — without it, every consumer's run at `@v1`
-re-resolves `claude-agent-sdk` and `unidiff` at install time, so an upstream
-breaking release silently breaks every consumer of an already-tagged,
-never-touched action.
+re-resolves `claude-agent-sdk`, `unidiff`, and `githubkit` at install time,
+so an upstream breaking release silently breaks every consumer of an
+already-tagged, never-touched action. `githubkit` pins a dated schema package
+(`githubkit-schemas-*`), which makes the lock file more load-bearing, not
+less.
 
 ## Phase 10: action.yml
 
@@ -789,12 +907,19 @@ keep it cheap.
    built specifically so the two flags produce different outcomes (the
    `dogfood` job's `uses: ./` cannot tell them apart).
 2. **Binary files in the diff** — real `GIT binary patch` blocks confirmed
-   via live `gh pr diff`. Mitigated in Phase 2 with a dedicated fixture case
+   via the live API. Mitigated in Phase 2 with a dedicated fixture case
    and defensive per-file exception handling.
-3. **`gh` not installed / not authenticated / wrong `--repo`** on some
-   future consumer's runner — Phase 3 differentiates these with distinct
-   actionable messages; `--repo` is now load-bearing on every invocation
+3. **Missing/insufficient token, or wrong `--repo`** on some future
+   consumer's runner — Phase 3 differentiates these by HTTP status with
+   distinct actionable messages (401/403 vs 404), and rejects a malformed
+   `--repo` slug up front. `--repo` is load-bearing on every invocation
    (this tool never assumes "the current repo").
+3b. **TLS interception on developer machines** — corporate proxies and
+   antivirus MITM break `certifi`-based verification, and an antivirus-set
+   `SSLKEYLOGFILE` can crash CPython's OpenSSL on Windows outright. Phase 3's
+   `_build_ssl_context` mitigates both (OS trust store via `truststore`,
+   `SSLKEYLOGFILE` suppressed). Applies equally to the Anthropic SDK in
+   Phase 5.
 4. **Zero-changed-files PR** — Phase 8 short-circuits before invoking the
    agent.
 5. **Agent never calls `submit_finding` or `submit_review_verdict`**
@@ -909,6 +1034,7 @@ keep it cheap.
 #### Automated
 
 - [x] 1.1 `uv run python -c "from pr_review_agent.models import Finding, ReviewOutput, Criterion, CriterionScore, ReviewVerdict"` works — 1271954
+- [x] 1.2 `uv run pytest tests/test_models.py -v` passes — pins `StrEnum` by serialization (`"side": "RIGHT"`, not `"DiffSide.RIGHT"`), enum rejection of unknown values, and the shared `ReviewEvent`
 
 ### Phase 2: diff_parser.py + tests
 
@@ -916,11 +1042,17 @@ keep it cheap.
 
 - [x] 2.1 `uv run pytest tests/test_diff_parser.py -v` passes — 6e76704
 
-### Phase 3: github_diff.py
+### Phase 3: github_diff.py + logging_config.py
+
+#### Automated
+
+- [x] 3.2 `uv run pytest tests/test_github_diff.py -v` passes (`resolve_repo` precedence + slug validation)
+- [ ] 3.3 `uv run pytest tests/test_logging_config.py -v` passes (redaction of each token format, incl. the traceback path) — still owed, see impl-review F5
 
 #### Manual
 
-- [x] 3.1 Verified manually against a real PR in this repo (throwaway PR if none exists yet); `find_repo_root()` returns the checkout root and degrades to `cwd` with a warning outside a git checkout
+- [x] 3.1 Verified manually against a real PR in this repo (throwaway PR if none exists yet); `find_repo_root()` returns the checkout root and degrades to `cwd` with a warning outside a git checkout — b7b0c3f
+- [x] 3.4 Re-verified end-to-end after the `gh` → `githubkit` transport switch: `resolve_repo`, `get_pr_metadata`, `get_pr_diff`, `parse_diff`, `exclude_paths`, `build_diff_context`, `find_repo_root` all exercised live against PR #1
 
 ### Phase 4: agents_context.py
 
