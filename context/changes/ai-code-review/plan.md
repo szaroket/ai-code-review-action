@@ -896,19 +896,19 @@ keep it cheap.
 
 #### Automated
 
-- [x] 0.1 `uv sync` succeeds
-- [x] 0.2 `uv run python -c "import pr_review_agent"` works
-- [x] 0.3 `pre-commit run --all-files` passes on the skeleton
+- [x] 0.1 `uv sync` succeeds — 0ae9e32
+- [x] 0.2 `uv run python -c "import pr_review_agent"` works — 0ae9e32
+- [x] 0.3 `pre-commit run --all-files` passes on the skeleton — 0ae9e32
 
 #### Manual
 
-- [x] 0.4 `.gitignore` trimmed of frontend-specific lines
+- [x] 0.4 `.gitignore` trimmed of frontend-specific lines — 0ae9e32
 
 ### Phase 1: models.py
 
 #### Automated
 
-- [ ] 1.1 `uv run python -c "from pr_review_agent.models import Finding, ReviewOutput, Criterion, CriterionScore, ReviewVerdict"` works
+- [x] 1.1 `uv run python -c "from pr_review_agent.models import Finding, ReviewOutput, Criterion, CriterionScore, ReviewVerdict"` works
 
 ### Phase 2: diff_parser.py + tests
 
