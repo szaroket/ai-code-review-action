@@ -1,17 +1,38 @@
 """Logging configuration: UTC timestamps, colorized console output, secret redaction."""
 
-import json
+import copy
 import logging
 import logging.config
 import re
 import sys
 import time
+from typing import Any
 
 _LOGGER_NAME = "pr_review_agent"
 
 _BEARER_TOKEN = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+")
 _GH_TOKEN = re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{20,})\b")
+_GH_FINE_GRAINED_PAT = re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")
 _ANTHROPIC_KEY = re.compile(r"\b(sk-ant-[A-Za-z0-9_-]{10,})\b")
+
+
+def redact(text: str) -> str:
+    """Replace GitHub/Anthropic secrets in `text` with `[REDACTED]`.
+
+    Shared by the log-record filter, the formatters' traceback rendering, and
+    subprocess error paths that never pass through a logging filter at all.
+
+    Args:
+        text: Arbitrary text that may contain tokens — a log message, a
+            rendered traceback, or captured subprocess stderr.
+
+    Returns:
+        str: The same text with every recognized token pattern replaced.
+    """
+    text = _BEARER_TOKEN.sub(r"\1[REDACTED]", text)
+    text = _GH_TOKEN.sub("[REDACTED]", text)
+    text = _GH_FINE_GRAINED_PAT.sub("[REDACTED]", text)
+    return _ANTHROPIC_KEY.sub("[REDACTED]", text)
 
 
 class _RedactionFilter(logging.Filter):
@@ -26,13 +47,28 @@ class _RedactionFilter(logging.Filter):
         Returns:
             bool: Always True — this filter never suppresses records.
         """
-        message = record.getMessage()
-        message = _BEARER_TOKEN.sub(r"\1[REDACTED]", message)
-        message = _GH_TOKEN.sub("[REDACTED]", message)
-        message = _ANTHROPIC_KEY.sub("[REDACTED]", message)
-        record.msg = message
+        record.msg = redact(record.getMessage())
         record.args = None
         return True
+
+
+class _RedactingFormatter(logging.Formatter):
+    """Base formatter that scrubs secrets out of rendered tracebacks.
+
+    The redaction filter only sees `record.getMessage()`; `exc_info` is
+    rendered separately by the formatter and would otherwise bypass it.
+    """
+
+    def formatException(self, ei: Any) -> str:
+        """Render the exception info, then redact secrets from it.
+
+        Args:
+            ei: The `sys.exc_info()`-style tuple carried by the record.
+
+        Returns:
+            str: The formatted traceback with tokens replaced.
+        """
+        return redact(super().formatException(ei))
 
 
 _LEVEL_COLORS = {
@@ -45,7 +81,7 @@ _LEVEL_COLORS = {
 _RESET = "\033[0m"
 
 
-class _ColoredConsoleFormatter(logging.Formatter):
+class _ColoredConsoleFormatter(_RedactingFormatter):
     """Console formatter that colorizes the log level name."""
 
     def format(self, record: logging.LogRecord) -> str:
@@ -73,29 +109,6 @@ class _ColoredConsoleFormatter(logging.Formatter):
             record.levelname = original_levelname
 
 
-class _JsonFormatter(logging.Formatter):
-    """Emit each log record as a single-line JSON object."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        """Serialize the record to JSON.
-
-        Args:
-            record: The log record being emitted.
-
-        Returns:
-            str: A JSON string representation of the record.
-        """
-        payload = {
-            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%SZ"),
-            "level": record.levelname,
-            "logger": f"{record.module}:{record.funcName}:{record.lineno}",
-            "message": record.getMessage(),
-        }
-        if record.exc_info:
-            payload["exc_info"] = self.formatException(record.exc_info)
-        return json.dumps(payload)
-
-
 _CONSOLE_FORMAT = (
     "[%(asctime)s][%(levelname)-8s] %(module)s:%(funcName)s:%(lineno)d | %(message)s"
 )
@@ -111,9 +124,6 @@ LOGGING_CONFIG: dict = {
             "()": _ColoredConsoleFormatter,
             "format": _CONSOLE_FORMAT,
             "datefmt": "%Y-%m-%d %H:%M:%S",
-        },
-        "json": {
-            "()": _JsonFormatter,
         },
     },
     "handlers": {
@@ -138,7 +148,7 @@ LOGGING_CONFIG: dict = {
 }
 
 
-def configure_logging(verbose: bool = False, json_format: bool = False) -> None:
+def configure_logging(verbose: bool = False) -> None:
     """Apply the logging configuration and force UTC timestamps.
 
     Call once at CLI startup, before the first log statement. Output goes to
@@ -148,16 +158,11 @@ def configure_logging(verbose: bool = False, json_format: bool = False) -> None:
     Args:
         verbose: When True, sets the `pr_review_agent` logger to DEBUG
             instead of INFO.
-        json_format: When True, emits structured JSON lines instead of the
-            colorized human-readable format.
     """
-    config = dict(LOGGING_CONFIG)
-    config["handlers"] = dict(LOGGING_CONFIG["handlers"])
-    config["handlers"]["console"] = dict(LOGGING_CONFIG["handlers"]["console"])
-    config["handlers"]["console"]["formatter"] = "json" if json_format else "console"
-
-    config["loggers"] = dict(LOGGING_CONFIG["loggers"])
-    config["loggers"][_LOGGER_NAME] = dict(LOGGING_CONFIG["loggers"][_LOGGER_NAME])
+    # dictConfig writes converted filter/formatter objects back into the dict
+    # it is given, so hand it a deep copy and keep LOGGING_CONFIG pristine for
+    # any later call.
+    config = copy.deepcopy(LOGGING_CONFIG)
     config["loggers"][_LOGGER_NAME]["level"] = "DEBUG" if verbose else "INFO"
 
     logging.config.dictConfig(config)
