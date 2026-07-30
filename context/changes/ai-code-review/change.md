@@ -1,7 +1,7 @@
 ---
 change_id: ai-code-review
 title: PR Review Action — reusable composite GitHub Action
-status: plan_reviewed
+status: implementing
 created: 2026-07-30
 updated: 2026-07-30
 archived_at: null

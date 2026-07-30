@@ -896,13 +896,13 @@ keep it cheap.
 
 #### Automated
 
-- [ ] 0.1 `uv sync` succeeds
-- [ ] 0.2 `uv run python -c "import pr_review_agent"` works
-- [ ] 0.3 `pre-commit run --all-files` passes on the skeleton
+- [x] 0.1 `uv sync` succeeds
+- [x] 0.2 `uv run python -c "import pr_review_agent"` works
+- [x] 0.3 `pre-commit run --all-files` passes on the skeleton
 
 #### Manual
 
-- [ ] 0.4 `.gitignore` trimmed of frontend-specific lines
+- [x] 0.4 `.gitignore` trimmed of frontend-specific lines
 
 ### Phase 1: models.py
 
