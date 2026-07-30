@@ -7,8 +7,15 @@ authors = [
     { name = "szaroket", email = "30178095+szaroket@users.noreply.github.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "unidiff>=1.0.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.10.9,<0.11.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

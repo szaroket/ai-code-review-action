@@ -1,0 +1,46 @@
+diff --git a/modified.py b/modified.py
+index 1111111..2222222 100644
+--- a/modified.py
++++ b/modified.py
+@@ -1,3 +1,4 @@
+ def greet(name):
+-    print("Hello " + name)
++    print("Hello, " + name)
++    return None
+
+diff --git a/new_file.py b/new_file.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/new_file.py
+@@ -0,0 +1,3 @@
++def added():
++    return True
++
+diff --git a/old_name.py b/new_name.py
+similarity index 85%
+rename from old_name.py
+rename to new_name.py
+index 4444444..5555555 100644
+--- a/old_name.py
++++ b/new_name.py
+@@ -1,2 +1,2 @@
+ def unchanged():
+-    return 42
++    return 43
+diff --git a/to_remove.py b/to_remove.py
+deleted file mode 100644
+index 6666666..0000000
+--- a/to_remove.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def obsolete():
+-    return "gone soon"
+diff --git a/image.png b/image.png
+index 7777777..8888888 100644
+GIT binary patch
+literal 10
+KcmZQ%U|?W;00aO5
+
+literal 12
+TcmZQ%U|?W;00aO500sa71poj5

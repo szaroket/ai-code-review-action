@@ -908,13 +908,13 @@ keep it cheap.
 
 #### Automated
 
-- [x] 1.1 `uv run python -c "from pr_review_agent.models import Finding, ReviewOutput, Criterion, CriterionScore, ReviewVerdict"` works
+- [x] 1.1 `uv run python -c "from pr_review_agent.models import Finding, ReviewOutput, Criterion, CriterionScore, ReviewVerdict"` works — 1271954
 
 ### Phase 2: diff_parser.py + tests
 
 #### Automated
 
-- [ ] 2.1 `uv run pytest tests/test_diff_parser.py -v` passes
+- [x] 2.1 `uv run pytest tests/test_diff_parser.py -v` passes
 
 ### Phase 3: github_diff.py
 
