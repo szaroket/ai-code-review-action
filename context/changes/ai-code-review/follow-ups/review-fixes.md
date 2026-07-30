@@ -5,20 +5,6 @@ Triaged: 2026-07-30
 
 ## Open
 
-### F5 (partial) — no tests on the redaction filter
-
-Skipped during triage. Tracked as unchecked Progress item **3.3** in `plan.md`.
-
-`_RedactionFilter` / `redact()` is the repo's only security control and has
-zero test coverage — a regex typo silently disables it. The F1 fix rewrote
-that code and added a `github_pat_` pattern and a `_RedactingFormatter`
-traceback path, so there is now *more* untested surface than when the finding
-was written.
-
-Wanted: `tests/test_logging_config.py` covering redaction of each token
-format (`Bearer`, `ghp_`, `github_pat_`, `sk-ant-`), the `formatException`
-traceback path, and that `configure_logging()` is safe to call twice.
-
 ### Pre-commit corrupts diff fixtures (noted in the review, not a finding)
 
 `.pre-commit-config.yaml`'s `trailing-whitespace` hook runs on
@@ -35,3 +21,8 @@ Fix: add `exclude: ^tests/fixtures/` to the whitespace/EOF hooks.
 F1, F2, F3, F4, F6, F7, F8, F9, F10 — see the review file for per-finding
 decisions. F6 and F7 were resolved at the root by the `gh` CLI → `githubkit`
 transport switch rather than by the patches originally proposed.
+
+F5 (partial, no tests on the redaction filter) — closed 2026-07-30 by user
+decision: no dedicated `tests/test_logging_config.py`. `tests/test_models.py`
+(the StrEnum-pinning tests from Phase 1) was removed on the same decision.
+Plan Progress 3.3 and 1.2 updated to reflect the skip.
