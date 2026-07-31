@@ -1145,7 +1145,7 @@ keep it cheap.
 
 #### Manual
 
-- [x] 7.1 Exercised via Testing Strategy step 7 (real `--publish` run against a scratch PR)
+- [x] 7.1 Exercised via Testing Strategy step 7 (real `--publish` run against a scratch PR) — 3e92edc
 
 ### Phase 8: cli.py
 
