@@ -1,7 +1,7 @@
 [project]
 name = "pr-review-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "Claude Agent SDK-powered PR diff reviewer, run as a reusable GitHub Action"
 readme = "README.md"
 authors = [
     { name = "szaroket", email = "30178095+szaroket@users.noreply.github.com" }
@@ -13,6 +13,9 @@ dependencies = [
     "truststore>=0.10.4",
     "unidiff>=1.0.0",
 ]
+
+[project.scripts]
+pr-review-agent = "pr_review_agent.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.10.9,<0.11.0"]

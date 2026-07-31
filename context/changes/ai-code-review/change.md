@@ -198,3 +198,18 @@ updated; the contract's steps were renumbered 1-12 to insert this as step 2.
 Full `pytest`/`ruff`/`pyright` gates re-run clean; no test file constructs
 `PullRequestMetadata` directly, so no existing tests needed updating for the
 two new required fields.
+
+**Phase 9 closed out (2026-07-31).** Added the missing
+`[project.scripts] pr-review-agent = "pr_review_agent.cli:main"` entry point
+to `pyproject.toml`; verified `uv run pr-review-agent --help` resolves via
+the console script. **Build-system left as `uv_build` (deviation from the
+plan's `hatchling` text)**: Phase 0's `uv init --lib` scaffolding already set
+`[build-system] requires = ["uv_build>=0.10.9,<0.11.0"]` /
+`build-backend = "uv_build"`, and it already builds/installs the package
+correctly — switching to hatchling would be pure churn with no functional
+difference for a single-package `src/` layout, so it was left as-is rather
+than escalated. `uv.lock` was already tracked and committed (not gitignored),
+consistent with the plan. Gate re-run clean: ruff ✅ · ruff format ✅ ·
+pyright ✅ 0 errors (both hit the known `SSLKEYLOGFILE`/AVG `OPENSSL_Applink`
+crash from Phase 3's TLS note until `SSLKEYLOGFILE` was unset for the shell)
+· pytest ✅ 40 passed, 1 skipped.

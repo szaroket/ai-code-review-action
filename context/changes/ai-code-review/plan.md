@@ -1223,7 +1223,7 @@ keep it cheap.
 
 #### Automated
 
-- [ ] 9.1 `uv run ruff check . && uv run ruff format --check . && uv run pyright` passes
+- [x] 9.1 `uv run ruff check . && uv run ruff format --check . && uv run pyright` passes
 
 ### Phase 10: action.yml
 
