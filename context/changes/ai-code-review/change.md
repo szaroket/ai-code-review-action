@@ -83,3 +83,29 @@ tests were dropped: no `tests/test_logging_config.py` was written, and
 Progress 1.2 and 3.3 marked done-by-decision — 07f9a59. All Phase 1-3
 Progress items are now checked; remaining gate state: ruff ✅ · ruff format ✅
 · pyright ✅ 0 errors · pytest ✅ 22 passed, 1 skipped.
+
+**Anthropic auth widened to support an OpenRouter-style gateway (2026-07-31,
+user decision during Phase 5).** The user's only funded billing account is
+OpenRouter, not the Anthropic Console, and asked for this to be the action's
+supported path going forward — not just a local workaround for this one
+smoke test. `anthropic-api-key` moved from a required `action.yml` input to
+optional, alongside two new optional inputs, `anthropic-base-url` and
+`anthropic-auth-token`, mapped to `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`.
+Verified directly against the installed `claude-agent-sdk` (0.2.128) source
+that this needs **zero changes to `review_agent.py`**:
+`_internal/transport/subprocess_cli.py` launches the bundled Claude Code CLI
+with `inherited_env = os.environ` merged under `ClaudeAgentOptions.env`, so
+whichever of the three env vars the `pr-review-agent` process itself sees,
+the CLI subprocess sees too. Phase 12's dogfood workflow now routes through
+OpenRouter (`anthropic-base-url: https://openrouter.ai/api`,
+`anthropic-auth-token: ${{ secrets.OPENROUTER_API_KEY }}`) instead of a
+direct `ANTHROPIC_API_KEY` secret. `plan.md` updated: the "Auth tokens"
+Key Decision (split into a GitHub-token bullet and a new "Anthropic auth"
+bullet), Phase 10's `action.yml` draft and its input-forwarding commentary,
+Phase 12's `self-test.yml` and `path-resolution-test` job, the README bullet
+under Phase 8, Testing Strategy step 3, and a new Risk #11 (setting both
+`ANTHROPIC_API_KEY` and the gateway vars silently defeats the gateway, since
+the CLI checks `ANTHROPIC_API_KEY` first — mitigated by a README warning,
+not code, since `cli.py` never touches these vars itself). A consumer that
+wants direct Anthropic billing is unaffected: `anthropic-api-key` alone still
+works exactly as before.
