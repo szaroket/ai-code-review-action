@@ -1299,17 +1299,17 @@ checkout here is correct, not a workaround.
 
 #### Manual
 
-- [ ] 10.1 `path-resolution-test` job (Phase 12 `self-test.yml`) passes per Testing Strategy step 5, confirming `--project` (not `--directory`) resolves paths against the caller's checkout with `action_path` != workspace
+- [x] 10.1 `path-resolution-test` job (Phase 12 `self-test.yml`) passes per Testing Strategy step 5, confirming `--project` (not `--directory`) resolves paths against the caller's checkout with `action_path` != workspace — 49e762b
 
 ### Phase 11: .github/workflows/ci.yml
 
 #### Automated
 
-- [ ] 11.1 CI job passes on a real PR to this repo (lint, typecheck, test)
+- [x] 11.1 CI job passes on a real PR to this repo (lint, typecheck, test) — 45ddec1
 
 ### Phase 12: .github/workflows/self-test.yml (dogfood)
 
 #### Manual
 
 - [x] 12.1 This repo's own discovery session completed, `review-criteria.md` and a minimal `AGENTS.md` committed
-- [ ] 12.2 Assignment-evidence smoke test per Testing Strategy step 4 (job visible in Actions tab, `--verbose` logs visible during the step, real inline comment visible on this repo's own PR)
+- [x] 12.2 Assignment-evidence smoke test per Testing Strategy step 4 (job visible in Actions tab, `--verbose` logs visible during the step, real inline comment visible on this repo's own PR) — 49e762b
