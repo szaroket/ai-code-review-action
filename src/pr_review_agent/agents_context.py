@@ -15,7 +15,6 @@ from pr_review_agent.models import Criterion
 
 logger = logging.getLogger(__name__)
 
-_CRITERION_COUNT = 5
 _CRITERION_HEADING = re.compile(r"^##[ \t]+(?P<name>.+?)[ \t]*$", re.MULTILINE)
 
 _ROLE_STATEMENT = (
@@ -34,14 +33,20 @@ _TOOL_USAGE_GUIDANCE = (
 
 _SUBMIT_FINDING_CONTRACT = (
     "For every issue you find, call `submit_finding` once. Do not batch "
-    "multiple issues into one call. When the issue relates to something "
-    'stated in "Repository Rules" or "Additional Lessons / Pitfalls", cite '
-    "it in `rule_reference`; otherwise leave `rule_reference` unset."
+    "multiple issues into one call. Every diff line below is pre-annotated "
+    "as `<old_line> <new_line> <marker><content>` — a `.` means that side has "
+    "no line there (e.g. an added line has no old_line). Set `line` to the "
+    "exact number shown in that annotation: the new_line column when "
+    '`side="RIGHT"`, the old_line column when `side="LEFT"`. Never count '
+    "lines yourself — a miscounted line number makes GitHub reject the "
+    "comment outright. When the issue relates to something stated in "
+    '"Repository Rules" or "Additional Lessons / Pitfalls", cite it in '
+    "`rule_reference`; otherwise leave `rule_reference` unset."
 )
 
 
 class InvalidReviewCriteriaError(ValueError):
-    """Raised when a criteria file does not contain exactly five `##` sections."""
+    """Raised when a criteria file contains no `##` sections at all."""
 
 
 def _read_required_file(path: Path, what: str) -> str:
@@ -64,22 +69,25 @@ def _read_required_file(path: Path, what: str) -> str:
         raise FileNotFoundError(f"{what.capitalize()} not found: {path}") from exc
 
 
-def load_rules_file(path: Path) -> str:
-    """Load the consumer's repository-rules file.
+def load_rules_file(path: Path) -> str | None:
+    """Load the consumer's optional repository-rules file.
 
-    A hard requirement: every review needs some notion of "the rules" to
-    check the diff against.
+    A soft dependency: not every repo has an `AGENTS.md` (or whatever the
+    consumer points `--rules-file` at), so a missing file is not an error —
+    the review proceeds without a "Repository Rules" section, scored only
+    against the loaded criteria.
 
     Args:
         path: Path to the rules file (e.g. an `AGENTS.md`).
 
     Returns:
-        str: The file's contents, verbatim.
-
-    Raises:
-        FileNotFoundError: If `path` does not exist.
+        str | None: The file's contents, or None if `path` doesn't exist.
     """
-    return _read_required_file(path, "rules file")
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        logger.warning("Rules file not found, continuing without it: %s", path)
+        return None
 
 
 def load_lessons_file(path: Path | None) -> str | None:
@@ -106,24 +114,26 @@ def load_lessons_file(path: Path | None) -> str | None:
 
 
 def load_review_criteria(path: Path) -> list[Criterion]:
-    """Load and parse the consumer's five review criteria.
+    """Load and parse the consumer's review criteria.
 
     Parses each `##` heading in `path` as one criterion: the heading text is
     the name, and the text up to the next `##` heading (or end of file) is
-    the description. Enforcing exactly five is what verifies the discovery
-    session described in plan.md's "Prerequisite" actually happened, for
-    whichever repo is consuming the action.
+    the description. The number of criteria is each repo's own call — a
+    small, focused stack has different review axes than a large polyglot
+    one — so nothing here enforces a fixed count; only requiring at least one
+    still verifies the discovery session described in plan.md's
+    "Prerequisite" actually happened, for whichever repo is consuming the
+    action.
 
     Args:
         path: Path to the criteria markdown file.
 
     Returns:
-        list[Criterion]: Exactly five criteria, in file order.
+        list[Criterion]: The criteria, in file order.
 
     Raises:
         FileNotFoundError: If `path` does not exist.
-        InvalidReviewCriteriaError: If the file doesn't contain exactly five
-            `##` headings.
+        InvalidReviewCriteriaError: If the file contains no `##` headings.
     """
     text = _read_required_file(path, "criteria file")
     headings = list(_CRITERION_HEADING.finditer(text))
@@ -138,10 +148,9 @@ def load_review_criteria(path: Path) -> list[Criterion]:
             )
         )
 
-    if len(criteria) != _CRITERION_COUNT:
+    if not criteria:
         raise InvalidReviewCriteriaError(
-            f"{path} must contain exactly {_CRITERION_COUNT} `##` criteria "
-            f"headings, found {len(criteria)}."
+            f"{path} must contain at least one `##` criterion heading, found none."
         )
     return criteria
 
@@ -194,30 +203,30 @@ def _submit_verdict_contract(criteria: list[Criterion]) -> str:
 
 
 def build_system_prompt(
-    rules_content: str,
+    rules_content: str | None,
     lessons_content: str | None,
     criteria: list[Criterion],
 ) -> str:
     """Compose the agent's system prompt from the consumer's loaded inputs.
 
-    Section order: role statement, review criteria, repository rules,
-    optional additional lessons, tool-usage guidance, then the
+    Section order: role statement, review criteria, optional repository
+    rules, optional additional lessons, tool-usage guidance, then the
     `submit_finding` and `submit_review_verdict` tool contracts.
 
     Args:
-        rules_content: The consumer's rules-file content, injected verbatim.
+        rules_content: The consumer's rules-file content, injected verbatim,
+            or None to omit the section entirely (not every repo has one).
         lessons_content: The consumer's lessons-file content, injected
             verbatim, or None to omit the section entirely.
-        criteria: The five loaded review criteria.
+        criteria: The loaded review criteria (however many the consumer's
+            criteria file defines).
 
     Returns:
         str: The complete system prompt.
     """
-    sections = [
-        _ROLE_STATEMENT,
-        _criteria_section(criteria),
-        f"## Repository Rules\n\n{rules_content}",
-    ]
+    sections = [_ROLE_STATEMENT, _criteria_section(criteria)]
+    if rules_content:
+        sections.append(f"## Repository Rules\n\n{rules_content}")
     if lessons_content:
         sections.append(f"## Additional Lessons / Pitfalls\n\n{lessons_content}")
     sections.append(_TOOL_USAGE_GUIDANCE)

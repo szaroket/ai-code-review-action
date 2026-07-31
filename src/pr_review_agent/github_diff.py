@@ -33,7 +33,11 @@ class GitHubApiError(RuntimeError):
 
 @dataclass(frozen=True)
 class PullRequestMetadata:
-    """A pull request's identifying fields and its changed-file paths."""
+    """A pull request's identifying fields and its changed-file paths.
+
+    `state`/`merged` let a caller skip reviewing a PR nobody can act on
+    anymore before fetching the diff or running the agent at all.
+    """
 
     number: int
     title: str
@@ -41,6 +45,8 @@ class PullRequestMetadata:
     base_ref_name: str
     head_ref_name: str
     files: list[str]
+    state: str
+    merged: bool
 
 
 def _build_ssl_context() -> ssl.SSLContext:
@@ -170,10 +176,9 @@ def resolve_repo(repo: str | None = None) -> tuple[str, str]:
         logger.debug("Resolved repo %s/%s from GITHUB_REPOSITORY", owner, name)
         return owner, name
 
-    remote = _git_output(["remote", "get-url", "origin"])
-    match = _REMOTE_URL.search(remote) if remote else None
-    if match:
-        owner, name = match.group("owner"), match.group("repo")
+    local_origin = _origin_repo()
+    if local_origin:
+        owner, name = local_origin
         logger.debug("Resolved repo %s/%s from the `origin` remote", owner, name)
         return owner, name
 
@@ -226,6 +231,8 @@ def get_pr_metadata(pr_number: int, repo: str | None = None) -> PullRequestMetad
         base_ref_name=pull_request.base.ref,
         head_ref_name=pull_request.head.ref,
         files=files,
+        state=pull_request.state,
+        merged=bool(pull_request.merged),
     )
 
 
@@ -270,15 +277,16 @@ def get_pr_diff(pr_number: int, repo: str | None = None) -> str:
     return diff_text
 
 
-def _git_output(args: list[str]) -> str | None:
+def _git_output(args: list[str], cwd: Path | None = None) -> str | None:
     """Run a read-only `git` command, returning stripped stdout or None.
 
     Never raises: every failure mode (missing `git`, OS error, timeout,
-    non-zero exit) is logged and reported as None, because both callers
-    degrade rather than fail.
+    non-zero exit) is logged and reported as None, because every caller
+    degrades rather than fails.
 
     Args:
         args: Arguments to pass to `git`, excluding the program name.
+        cwd: Directory to run `git` in. Defaults to the current directory.
 
     Returns:
         str | None: Stripped stdout on success, otherwise None.
@@ -287,11 +295,12 @@ def _git_output(args: list[str]) -> str | None:
         logger.warning("`git` not found on PATH")
         return None
 
-    logger.debug("Running: git %s (cwd=%s)", " ".join(args), Path.cwd())
+    cwd = cwd or Path.cwd()
+    logger.debug("Running: git %s (cwd=%s)", " ".join(args), cwd)
     try:
         result = subprocess.run(
             ["git", *args],
-            cwd=Path.cwd(),
+            cwd=cwd,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -308,6 +317,23 @@ def _git_output(args: list[str]) -> str | None:
         return None
 
     return result.stdout.strip()
+
+
+def _origin_repo(cwd: Path | None = None) -> tuple[str, str] | None:
+    """Resolve the `owner, name` pair from a checkout's `origin` remote.
+
+    Args:
+        cwd: The checkout to inspect. Defaults to the current directory.
+
+    Returns:
+        tuple[str, str] | None: The owner and repository name, or None if
+        `origin` isn't set, isn't a GitHub URL, or `git` itself is unusable.
+    """
+    remote = _git_output(["remote", "get-url", "origin"], cwd=cwd)
+    match = _REMOTE_URL.search(remote) if remote else None
+    if not match:
+        return None
+    return match.group("owner"), match.group("repo")
 
 
 def find_repo_root() -> Path:
