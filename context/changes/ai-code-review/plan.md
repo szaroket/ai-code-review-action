@@ -1139,7 +1139,7 @@ keep it cheap.
 
 #### Automated
 
-- [x] 6.1 `uv run pytest tests/test_output.py -v` passes
+- [x] 6.1 `uv run pytest tests/test_output.py -v` passes — 3069a93
 
 ### Phase 7: github_publish.py (real PR-comment posting)
 
