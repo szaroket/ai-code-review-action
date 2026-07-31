@@ -1211,13 +1211,13 @@ keep it cheap.
 
 #### Automated
 
-- [x] 8.1 `uv run pytest tests/test_cli.py -v` passes (scope filter unit tests)
+- [x] 8.1 `uv run pytest tests/test_cli.py -v` passes (scope filter unit tests) — f819052
 
 #### Manual
 
-- [x] 8.2 Exit-code contract smoke test per Testing Strategy step 9
-- [x] 8.3 `--publish` and post-failure smoke tests per Testing Strategy steps 7-8
-- [x] 8.4 Closed/merged-PR guard confirmed live per Testing Strategy step 8b (exit `0`, no diff fetch, no agent run, no publish attempt)
+- [x] 8.2 Exit-code contract smoke test per Testing Strategy step 9 — f819052
+- [x] 8.3 `--publish` and post-failure smoke tests per Testing Strategy steps 7-8 — f819052
+- [x] 8.4 Closed/merged-PR guard confirmed live per Testing Strategy step 8b (exit `0`, no diff fetch, no agent run, no publish attempt) — f819052
 
 ### Phase 9: final pyproject.toml
 
