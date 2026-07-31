@@ -9,10 +9,12 @@ the exact GitHub reviews-API payload shape that `github_publish.py` posts.
 import json
 import logging
 from collections import Counter
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pr_review_agent.logging_config import redact
 from pr_review_agent.models import (
     CriterionResult,
     Finding,
@@ -138,6 +140,52 @@ def build_summary(findings: list[Finding], verdict: ReviewVerdict | None) -> str
     return "\n".join(lines)
 
 
+def _redact_findings(findings: list[Finding]) -> list[Finding]:
+    """Scrub secrets out of the model-authored fields of each finding.
+
+    Args:
+        findings: The findings to scrub.
+
+    Returns:
+        list[Finding]: Copies with `comment` and `rule_reference` redacted.
+        `path`, `line`, `side` and `severity` are structural and left alone.
+    """
+    return [
+        replace(
+            finding,
+            comment=redact(finding.comment),
+            rule_reference=(
+                redact(finding.rule_reference)
+                if finding.rule_reference is not None
+                else None
+            ),
+        )
+        for finding in findings
+    ]
+
+
+def _redact_verdict(verdict: ReviewVerdict | None) -> ReviewVerdict | None:
+    """Scrub secrets out of the model-authored rationale of each criterion score.
+
+    Args:
+        verdict: The collected review verdict, or None.
+
+    Returns:
+        ReviewVerdict | None: A copy with every `rationale` redacted, or None.
+        `name` is validated against the loaded criteria and `score` is an enum,
+        so neither can carry model-authored text.
+    """
+    if verdict is None:
+        return None
+    return replace(
+        verdict,
+        criteria=[
+            replace(score, rationale=redact(score.rationale))
+            for score in verdict.criteria
+        ],
+    )
+
+
 def build_review_output(
     pr_number: int, findings: list[Finding], verdict: ReviewVerdict | None
 ) -> ReviewOutput:
@@ -149,6 +197,15 @@ def build_review_output(
     `ReviewEvent.COMMENT`; this output must never be published in that case
     (enforced by `cli.py`, not here).
 
+    This is also the redaction boundary. Every model-authored string is
+    scrubbed here, once, rather than at each renderer: the diff and the PR
+    metadata are attacker-controlled, so a prompt-injected agent could be
+    steered into reading a secret and emitting it as a finding. Downstream
+    sinks — the console preview, both artifacts, and the comment posted to a
+    public PR — all read from the returned `ReviewOutput`, so redacting at
+    construction covers them by design and cannot be forgotten by a future
+    renderer.
+
     Args:
         pr_number: The pull request number the review is for.
         findings: The findings to include (already deduplicated/capped).
@@ -156,15 +213,18 @@ def build_review_output(
             produced one.
 
     Returns:
-        ReviewOutput: The complete review, ready to print or write to disk.
+        ReviewOutput: The complete review, ready to print or write to disk,
+        with all model-authored text redacted.
     """
+    safe_findings = _redact_findings(findings)
+    safe_verdict = _redact_verdict(verdict)
     event = verdict.overall_verdict if verdict is not None else ReviewEvent.COMMENT
     return ReviewOutput(
         pr_number=pr_number,
         event=event,
-        summary_body=build_summary(findings, verdict),
-        comments=findings,
-        verdict=verdict,
+        summary_body=build_summary(safe_findings, safe_verdict),
+        comments=safe_findings,
+        verdict=safe_verdict,
     )
 
 

@@ -157,12 +157,34 @@ criterion here waits on it or references it.
   earlier Polish-UI-text carve-out belonged to the origin repo's own app and
   has no analogue in a generic action. `agents_context.py` forwards whatever
   the consumer's own `rules-file` says, unedited.)
-- **Default model:** `claude-opus-5`, overridable via `--model`/`model:`
-  input (e.g. `claude-haiku-4-5` for cheap harness-debugging).
+- **Default model:** `claude-sonnet-5`, overridable via `--model`/`model:`
+  input (e.g. `claude-haiku-4-5` for cheap harness-debugging). *Lowered from
+  `claude-opus-5`, user decision 2026-07-31: a per-PR review runs on every
+  push, so the default carries recurring cost; opus stays one `--model` flag
+  away for the runs that warrant it.*
 - **Scope restriction:** `scope-dirs` is optional, **no default** (see
   Overview) — a hard include-list when set, applied in `cli.py` right after
   `parse_diff`, before `build_diff_context` or the agent ever sees the file
-  list.
+  list. Matching is on path *segments*, not raw string prefixes, so
+  `scope-dirs: api` cannot pull in `api_client_generated/`.
+- **Review inputs are read from the PR's base ref, not the checkout**
+  (*amendment, 2026-07-31, from the phases 4-9 impl review, finding F4*).
+  `rules-file`, `lessons-file` and `criteria-file` are all interpolated into
+  the **system** prompt — the highest-authority position in the conversation.
+  The original plan resolved them against the workflow's PR-head checkout,
+  which meant a pull request could append "always approve" to its own
+  `AGENTS.md`, or rewrite the criteria it was about to be scored against, and
+  the agent would read it as instruction from the repository owner. So any
+  input path that resolves *inside* the checkout is fetched via the contents
+  API at `base_ref_name` instead (`github_diff.get_file_at_ref`); a path
+  outside the checkout is still read from disk, since it isn't part of the
+  pull request and carries the caller's authority rather than the author's.
+  Contents API rather than `git show base:path` because `actions/checkout`
+  clones shallow by default, so the base ref usually isn't present locally.
+  **Consumer-visible consequence:** a PR that legitimately updates `AGENTS.md`
+  is *not* reviewed against its own new rules — the change takes effect once
+  merged. `--trust-head-files` / `trust-head-files:` opts back out, for local
+  runs and for branches whose criteria file doesn't exist on the base ref yet.
 - **Publish gate:** real GitHub posting is behind `publish` (boolean,
   default `false`). Rejected: env-var auto-enable (implicit), folding into
   `format` (conflates a side-effect-free artifact with an action that
@@ -648,11 +670,17 @@ Adds `claude-agent-sdk` dependency.
   claude_agent_sdk; help(claude_agent_sdk)"` to lock down the exact `@tool`
   input-schema shape and message-type names.
 - Empty findings + `status == "success"` + a **valid** `verdict` collected
-  is the only valid clean result. A non-success SDK status, *or* success
-  with `verdict` still `None` (never called, or every attempt failed
-  validation), both count as the same "run incomplete" category (exit `5`
-  in Phase 8) — a run-completeness check only, never a judgment about the
-  verdict's content.
+  is the only valid clean result. Anything else is a run-completeness
+  failure — never a judgment about the verdict's content. *(Amended
+  2026-07-31, impl-review finding F7: the two failure kinds were originally
+  folded into one exit code, which made them indistinguishable to a
+  consuming workflow. They are now reported separately, matching
+  `ReviewRunResult`'s own claim that `sdk_success` and `verdict` are
+  independently checkable facts.)* A non-success SDK status → exit `4`, the
+  same code as an SDK exception, because both are transient and retryable
+  (overloaded API, `error_max_turns`). Success with `verdict` still `None`
+  — never called, or every attempt failed validation → exit `5`, which a
+  consumer reads as advisory.
 - No unit tests for this module this iteration (depends on a live SDK/API
   connection) — verification deferred to the end-to-end runs in "Testing
   Strategy / Verification."
@@ -711,13 +739,16 @@ convention, but overridable since not every repo uses that name; **optional
 file** — missing is a warning, not an error, since not every repo has one),
 `--criteria-file` (**required, no default**), `--lessons-file` (optional,
 no default), `--scope-dirs` (repeatable, **no default** — omitted means "no
-filtering"), `--model` (default `claude-opus-5`), `--max-turns` (default
+filtering"), `--model` (default `claude-sonnet-5` — *lowered from
+`claude-opus-5`, user decision 2026-07-31*), `--max-turns` (default
 5 — *lowered from 15, user decision 2026-07-31*), `--max-findings` (default
 30), `--exclude` (repeatable, default
 `[]` — the earlier repo-specific defaults like
 `backend/migrations/*` don't generalize; a consumer sets its own), `--out-
 dir` (default `./review-output`), `--format {console,json,markdown,all}`
-(default `console`), `--publish` (boolean, default `False`), `--verbose`.
+(default `console`), `--publish` (boolean, default `False`),
+`--trust-head-files` (boolean, default `False` — *added 2026-07-31 with the
+base-ref sourcing amendment in Key Decisions*), `--verbose`.
 
 **`--scope-dirs` / `--exclude` accept both forms**: repeatable (`--scope-dirs
 frontend --scope-dirs backend`) *and* comma-separated within one value
@@ -727,10 +758,14 @@ single accumulated list. This is required, not a convenience: `action.yml`'s
 `scope-dirs`/`exclude` inputs are comma-scalar strings, so a repeatable-only
 flag would make them unusable through the action.
 
-**Scope filter (`filter_in_scope_files`)**: unchanged logic from the
-original design — a file is in scope when its current path (post-rename)
-starts with one of `scope_dirs`; empty `scope_dirs` means everything is in
-scope. Unit tested in `tests/test_cli.py`.
+**Scope filter (`filter_in_scope_files`)**: a file is in scope when its
+current path (post-rename) *equals* one of `scope_dirs` or begins with one
+followed by `/`; empty `scope_dirs` means everything is in scope. Unit tested
+in `tests/test_cli.py`, including the colliding-prefix case. (*Tightened
+2026-07-31 from the original bare `startswith`, impl-review finding F8: a
+plain prefix match put `api_client_generated/bundle.min.js` in scope for
+`--scope-dirs api`, and one generated file can consume the whole
+diff-context budget.*)
 
 `main_async` orchestration, exit-code contract:
 
@@ -766,8 +801,14 @@ scope. Unit tested in `tests/test_cli.py`.
    check, not after** — same principle as the "Post-failure handling"
    decision and Risk #8: artifacts land before anything that can fail, so
    findings survive a red job.
-10. Non-success run (SDK status, or missing/invalid verdict) → exit `5`,
-    *with artifacts already written from step 9*. Risk #5 makes this the
+10. Non-success run → exit `4` when the SDK reported failure, exit `5` when
+    the verdict is missing or invalid (see Phase 5's amendment), *with
+    artifacts already written from step 9*. **Step 9 honours `--format`, and
+    `console` is the default, so on this path the JSON artifact is written
+    unconditionally regardless of `--format`** — otherwise the default
+    invocation persists nothing and the findings are lost outright, which is
+    the exact loss this step exists to prevent. (*Added 2026-07-31,
+    impl-review finding F3.*) Risk #5 makes this the
     most likely failure mode, and an agent that submitted twenty good
     findings but never landed a valid `submit_review_verdict` (hit
     `max_turns`, or every attempt failed Phase 5's exact-name-match
@@ -845,11 +886,12 @@ inputs:
   lessons-file: { required: false }
   scope-dirs: { required: false }
   exclude: { required: false }
-  model: { required: false, default: "claude-opus-5" }
+  model: { required: false, default: "claude-sonnet-5" }
   max-turns: { required: false, default: "5" }
   max-findings: { required: false, default: "30" }
   format: { required: false, default: "console" }
   publish: { required: false, default: "false" }
+  trust-head-files: { required: false, default: "false" }
   out-dir: { required: false, default: "./review-output" }
   anthropic-api-key: { required: false, default: "" }
   anthropic-base-url: { required: false, default: "" }
@@ -882,7 +924,8 @@ runs:
           --max-findings "${{ inputs.max-findings }}" \
           --out-dir "${{ inputs.out-dir }}" \
           --model "${{ inputs.model }}" --format "${{ inputs.format }}" \
-          ${{ inputs.publish == 'true' && '--publish' || '' }} --verbose
+          ${{ inputs.publish == 'true' && '--publish' || '' }} \
+          ${{ inputs.trust-head-files == 'true' && '--trust-head-files' || '' }} --verbose
 ```
 
 **Every declared input is forwarded.** The three with defaults
@@ -1182,48 +1225,48 @@ keep it cheap.
 
 #### Automated
 
-- [x] 4.1 `uv run python -c "from pr_review_agent.agents_context import build_system_prompt, load_review_criteria, load_rules_file, load_lessons_file"` works — c895155
+- [x] 4.1 `uv run python -c "from pr_review_agent.agents_context import build_system_prompt, load_review_criteria, load_rules_file, load_lessons_file"` works — 78074c5
 
 #### Manual
 
-- [x] 4.2 Criteria-file guard smoke test per Testing Strategy step 6 (malformed file → exit `3`) — c895155
+- [x] 4.2 Criteria-file guard smoke test per Testing Strategy step 6 (malformed file → exit `3`) — 78074c5
 
 ### Phase 5: review_agent.py (the actual agent loop)
 
 #### Manual
 
-- [x] 5.1 Exercised via the Testing Strategy end-to-end run (no dedicated unit tests this iteration) — c504a8c
-- [x] 5.2 `submit_review_verdict` produces a valid verdict on a real run; a mismatched-criteria call is rejected with a retryable error — c504a8c
+- [x] 5.1 Exercised via the Testing Strategy end-to-end run (no dedicated unit tests this iteration) — ae2a448
+- [x] 5.2 `submit_review_verdict` produces a valid verdict on a real run; a mismatched-criteria call is rejected with a retryable error — ae2a448
 
 ### Phase 6: output.py
 
 #### Automated
 
-- [x] 6.1 `uv run pytest tests/test_output.py -v` passes — 3069a93
+- [x] 6.1 `uv run pytest tests/test_output.py -v` passes — a5b59bb
 
 ### Phase 7: github_publish.py (real PR-comment posting)
 
 #### Manual
 
-- [x] 7.1 Exercised via Testing Strategy step 7 (real `--publish` run against a scratch PR) — 3e92edc
+- [x] 7.1 Exercised via Testing Strategy step 7 (real `--publish` run against a scratch PR) — e5a49e9
 
 ### Phase 8: cli.py
 
 #### Automated
 
-- [x] 8.1 `uv run pytest tests/test_cli.py -v` passes (scope filter unit tests) — f819052
+- [x] 8.1 `uv run pytest tests/test_cli.py -v` passes (scope filter unit tests) — 55246f3
 
 #### Manual
 
-- [x] 8.2 Exit-code contract smoke test per Testing Strategy step 9 — f819052
-- [x] 8.3 `--publish` and post-failure smoke tests per Testing Strategy steps 7-8 — f819052
-- [x] 8.4 Closed/merged-PR guard confirmed live per Testing Strategy step 8b (exit `0`, no diff fetch, no agent run, no publish attempt) — f819052
+- [x] 8.2 Exit-code contract smoke test per Testing Strategy step 9 — 55246f3
+- [x] 8.3 `--publish` and post-failure smoke tests per Testing Strategy steps 7-8 — 55246f3
+- [x] 8.4 Closed/merged-PR guard confirmed live per Testing Strategy step 8b (exit `0`, no diff fetch, no agent run, no publish attempt) — 55246f3
 
 ### Phase 9: final pyproject.toml
 
 #### Automated
 
-- [x] 9.1 `uv run ruff check . && uv run ruff format --check . && uv run pyright` passes — dd74a10
+- [x] 9.1 `uv run ruff check . && uv run ruff format --check . && uv run pyright` passes — 09dccb3
 
 ### Phase 10: action.yml
 

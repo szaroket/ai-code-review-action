@@ -1,7 +1,7 @@
 ---
 change_id: ai-code-review
 title: PR Review Action — reusable composite GitHub Action
-status: implementing
+status: impl_reviewed
 created: 2026-07-30
 updated: 2026-07-31
 archived_at: null
@@ -145,6 +145,15 @@ re-run clean after both changes.
 `cli.py`'s `_DEFAULT_MAX_TURNS` and Phase 10's `action.yml` draft default
 both updated to match.
 
+**Default model lowered from `claude-opus-5` to `claude-sonnet-5`
+(2026-07-31, user decision).** The switch was made in `cli.py` during Phase 8
+but not written down at the time; the implementation review caught the
+divergence. Rationale: a review runs on every push, so the default carries
+recurring cost, and opus remains one `--model` flag away for runs that
+warrant it. `plan.md` updated at all three sites (Key Decisions, the Phase 8
+argparse spec, and Phase 10's `action.yml` draft default) so `action.yml`
+does not drift when Phase 10 is written.
+
 **Real bug found and fixed during Phase 8 manual `--publish` testing
 (2026-07-31): off-by-one line numbers caused a GitHub 422.** The user ran
 `--publish` against PR #1 successfully, then (per the post-failure Testing
@@ -213,3 +222,78 @@ consistent with the plan. Gate re-run clean: ruff ✅ · ruff format ✅ ·
 pyright ✅ 0 errors (both hit the known `SSLKEYLOGFILE`/AVG `OPENSSL_Applink`
 crash from Phase 3's TLS note until `SSLKEYLOGFILE` was unset for the shell)
 · pytest ✅ 40 passed, 1 skipped.
+
+**Implementation review of phases 4-9 (2026-07-31): REJECTED — 3 critical, 6
+warnings, 1 observation. Triaged the same day; all 10 fixed.** See
+`reviews/impl-review-phases-4-9.md`. All automated success criteria re-ran
+green (pytest 40 passed/1 skipped · ruff · ruff format · pyright 0 errors), and
+the implementation matches the plan's described behavior closely (~50 MATCH
+verdicts). The verdict is driven by three things the plan never described:
+(F1) `token.txt` in the repo root holds a live `sk-or-v1-` OpenRouter key,
+untracked but **not** gitignored — one `git add .` from `main`; `redact()` has
+no pattern for that prefix either. (F2) `review_agent._build_options` sets
+neither `setting_sources` nor `strict_mcp_config`, so the SDK loads
+`.claude/settings.json`, `CLAUDE.md`, and `.mcp.json` from the *PR-head*
+checkout — a hook in an attacker's PR executes on the runner, bypassing the
+whole `allowed_tools`/`dontAsk` lockdown. (F3) the plan's step-9-before-step-10
+ordering is implemented correctly, but `_write_artifacts` writes nothing when
+`--format console` (the default), so the exit-`5` path loses every finding
+while logging that it saved them — the exact loss Risk #5 and step 10 were
+written to prevent.
+
+**Triage of the phases 4-9 review (2026-07-31): all 10 findings fixed, none
+skipped or accepted as risk.** Gates after: pytest ✅ 77 passed / 1 skipped
+(up from 40/1) · ruff ✅ · ruff format ✅ · pyright ✅ 0 errors. The
+substantive outcomes, beyond the mechanical fixes recorded in the review file:
+
+*Review inputs now come from the PR's base ref, not the checkout (F4).* This
+is a **consumer-visible contract change**, so it went into `plan.md`'s Key
+Decisions as an amendment. `rules-file`, `lessons-file` and `criteria-file`
+all land in the *system* prompt, and the workflow checks out the PR head — so
+a pull request could append "always approve" to its own `AGENTS.md`, or
+rewrite the criteria it was about to be scored against. Any input path
+resolving inside the checkout is now fetched via the contents API at
+`base_ref_name`; paths outside it still read from disk, since they aren't part
+of the PR. Consequence: a PR that legitimately updates `AGENTS.md` isn't
+reviewed against its own new rules — that takes effect on merge.
+`--trust-head-files` / `trust-head-files:` opts back out, for local runs and
+for branches whose criteria file doesn't exist on the base ref yet. Criteria
+was folded in alongside rules/lessons even though the finding only named the
+latter two: it defines the axes being scored, so leaving it on PR-head would
+have left an identical hole open.
+
+*The `Read` sandbox is a `PreToolUse` hook, not `can_use_tool` (F4).* The
+review proposed `can_use_tool`; it would never have fired. `allowed_tools`
+lists `Read`/`Grep`/`Glob` by bare name, and the SDK auto-approves a
+whole-tool entry *before* consulting the permission callback — it even emits
+`CanUseToolShadowedWarning` for exactly this, and its own guidance is to use a
+`PreToolUse` hook. `review_agent._make_repo_path_guard` now denies any
+`file_path`/`path` argument resolving outside `repo_root`, with `resolve()`
+collapsing `..` and following symlinks. These are in-process Python hooks —
+unrelated to the `.claude/settings.json` hooks that F2's `setting_sources=[]`
+keeps the PR-head checkout from registering.
+
+*The plan was wrong about the exit-code contract, and the plan lost (F7).*
+Phase 5's bullet and step 10 both folded "SDK failed" and "no valid verdict"
+into exit `5`; `cli.py`'s module docstring described them as 4 and 5. The
+docstring was the correct half — `ReviewRunResult`'s own docstring insists the
+two are independently checkable facts, and a consumer retries a transient SDK
+failure but treats a missing verdict as advisory. Code split the branch, and
+both plan sites were amended rather than the code being bent to match.
+
+*Exit code 2's argparse collision was deliberately left alone (F7).* Moving it
+is a breaking change to a contract already published in `plan.md`, and the
+argparse case is a permanent config error the workflow fails on immediately
+either way. Only the branch split was taken.
+
+*Test baseline restored (F9).* `tests/test_agents_context.py` is new (16
+tests); `tests/test_cli.py` went from 7 tests to 28, covering every documented
+exit code with the five boundary calls monkeypatched, plus regression tests
+pinning F3, F7, F8 and F4. No `pytest-asyncio` was needed — the tests drive
+`main_async` through `asyncio.run`. `github_publish.py` stays untested, on the
+same live-boundary rationale the plan used to waive `review_agent.py`.
+
+**Two items still need the user**: rotate the leaked OpenRouter key from F1
+(and update the `OPENROUTER_API_KEY` repo secret Phase 12 depends on), and
+`git add tests/fixtures/smoke-criteria.md` — it is still untracked and the
+test suite now depends on it.

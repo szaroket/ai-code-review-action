@@ -230,3 +230,8 @@ __marimo__/
 
 # 10xDevs skills
 .claude/
+
+# Secrets — never commit credentials, even scratch copies
+token.txt
+*.token
+secrets*

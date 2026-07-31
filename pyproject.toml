@@ -10,6 +10,11 @@ requires-python = ">=3.13"
 dependencies = [
     "claude-agent-sdk>=0.2.128",
     "githubkit>=0.16.0",
+    # Imported directly by github_publish.py for the reviews-endpoint body
+    # type. It currently arrives transitively via githubkit, but a githubkit
+    # release that vendors or renames it would break the import at module load
+    # — before argparse runs, so with no mapped exit code.
+    "githubkit-schemas>=26.7.29",
     "truststore>=0.10.4",
     "unidiff>=1.0.0",
 ]

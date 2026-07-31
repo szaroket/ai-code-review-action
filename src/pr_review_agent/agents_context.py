@@ -135,7 +135,29 @@ def load_review_criteria(path: Path) -> list[Criterion]:
         FileNotFoundError: If `path` does not exist.
         InvalidReviewCriteriaError: If the file contains no `##` headings.
     """
-    text = _read_required_file(path, "criteria file")
+    return parse_review_criteria(_read_required_file(path, "criteria file"), str(path))
+
+
+def parse_review_criteria(text: str, source: str) -> list[Criterion]:
+    """Parse review criteria out of already-loaded markdown text.
+
+    Split from `load_review_criteria` because the criteria file is not always
+    read from disk: `cli.py` fetches it from the pull request's *base* ref, so
+    that a PR cannot rewrite the axes it is about to be scored against (see
+    `github_diff.get_file_at_ref`). Only the reading differs; the parsing rule
+    is identical either way.
+
+    Args:
+        text: The criteria file's markdown content.
+        source: Where `text` came from, used only in the error message —
+            a path, or something like `"AGENTS.md at base ref main"`.
+
+    Returns:
+        list[Criterion]: The criteria, in file order.
+
+    Raises:
+        InvalidReviewCriteriaError: If `text` contains no `##` headings.
+    """
     headings = list(_CRITERION_HEADING.finditer(text))
     criteria = []
     for index, heading in enumerate(headings):
@@ -150,7 +172,7 @@ def load_review_criteria(path: Path) -> list[Criterion]:
 
     if not criteria:
         raise InvalidReviewCriteriaError(
-            f"{path} must contain at least one `##` criterion heading, found none."
+            f"{source} must contain at least one `##` criterion heading, found none."
         )
     return criteria
 

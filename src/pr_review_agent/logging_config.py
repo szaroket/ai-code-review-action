@@ -14,10 +14,11 @@ _BEARER_TOKEN = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+")
 _GH_TOKEN = re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{20,})\b")
 _GH_FINE_GRAINED_PAT = re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")
 _ANTHROPIC_KEY = re.compile(r"\b(sk-ant-[A-Za-z0-9_-]{10,})\b")
+_OPENROUTER_KEY = re.compile(r"\b(sk-or-(?:v\d+-)?[A-Za-z0-9_-]{10,})\b")
 
 
 def redact(text: str) -> str:
-    """Replace GitHub/Anthropic secrets in `text` with `[REDACTED]`.
+    """Replace GitHub/Anthropic/OpenRouter secrets in `text` with `[REDACTED]`.
 
     Shared by the log-record filter, the formatters' traceback rendering, and
     subprocess error paths that never pass through a logging filter at all.
@@ -32,11 +33,12 @@ def redact(text: str) -> str:
     text = _BEARER_TOKEN.sub(r"\1[REDACTED]", text)
     text = _GH_TOKEN.sub("[REDACTED]", text)
     text = _GH_FINE_GRAINED_PAT.sub("[REDACTED]", text)
-    return _ANTHROPIC_KEY.sub("[REDACTED]", text)
+    text = _ANTHROPIC_KEY.sub("[REDACTED]", text)
+    return _OPENROUTER_KEY.sub("[REDACTED]", text)
 
 
 class _RedactionFilter(logging.Filter):
-    """Scrub GitHub/Anthropic tokens from every emitted log record."""
+    """Scrub GitHub/Anthropic/OpenRouter tokens from every emitted log record."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         """Render the full message and replace secrets with [REDACTED].

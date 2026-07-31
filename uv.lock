@@ -478,6 +478,7 @@ source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
     { name = "githubkit" },
+    { name = "githubkit-schemas" },
     { name = "truststore" },
     { name = "unidiff" },
 ]
@@ -493,6 +494,7 @@ dev = [
 requires-dist = [
     { name = "claude-agent-sdk", specifier = ">=0.2.128" },
     { name = "githubkit", specifier = ">=0.16.0" },
+    { name = "githubkit-schemas", specifier = ">=26.7.29" },
     { name = "truststore", specifier = ">=0.10.4" },
     { name = "unidiff", specifier = ">=1.0.0" },
 ]

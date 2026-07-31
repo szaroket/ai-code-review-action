@@ -16,9 +16,9 @@ from githubkit_schemas.latest.types import (
 )
 
 from pr_review_agent.github_diff import (
-    _HTTP_TIMEOUT_SECONDS,
+    HTTP_TIMEOUT_SECONDS,
     GitHubApiError,
-    _client,
+    build_client,
     resolve_repo,
 )
 from pr_review_agent.logging_config import redact
@@ -75,7 +75,7 @@ def _raise_for_publish_error(exc: Exception, context: str) -> GitHubPublishError
         )
     if isinstance(exc, RequestTimeout):
         return GitHubPublishError(
-            f"Timed out after {_HTTP_TIMEOUT_SECONDS:.0f}s while posting the "
+            f"Timed out after {HTTP_TIMEOUT_SECONDS:.0f}s while posting the "
             f"review for {context}."
         )
     return GitHubPublishError(
@@ -108,7 +108,7 @@ def post_review(
     """
     try:
         owner, name = resolve_repo(repo)
-        github = _client()
+        github = build_client()
     except GitHubApiError as exc:
         raise GitHubPublishError(str(exc)) from exc
 

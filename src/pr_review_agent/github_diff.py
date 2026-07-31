@@ -1,4 +1,10 @@
-"""GitHub REST access via githubkit: PR metadata, PR diffs, repo-root resolution."""
+"""GitHub REST access via githubkit: PR metadata, PR diffs, repo-root resolution.
+
+`HTTP_TIMEOUT_SECONDS`, `build_client` and `origin_repo` are public on purpose:
+`github_publish.py` needs the first two to talk to the same API with the same
+TLS/timeout handling, and `cli.py` needs the third for its repo-mismatch guard.
+Everything else here is private to this module.
+"""
 
 import logging
 import os
@@ -19,7 +25,11 @@ logger = logging.getLogger(__name__)
 
 _TOKEN_ENV_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 _DIFF_MEDIA_TYPE = "application/vnd.github.diff"
-_HTTP_TIMEOUT_SECONDS = 60.0
+_RAW_MEDIA_TYPE = "application/vnd.github.raw"
+
+# Public: `github_publish.py` quotes it in its own timeout message so both
+# modules report the same number.
+HTTP_TIMEOUT_SECONDS = 60.0
 _GIT_TIMEOUT_SECONDS = 30
 _REPO_SLUG = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 _REMOTE_URL = re.compile(
@@ -94,7 +104,7 @@ def _resolve_token() -> str:
     )
 
 
-def _client() -> GitHub:
+def build_client() -> GitHub:
     """Construct an authenticated githubkit client.
 
     Returns:
@@ -105,7 +115,7 @@ def _client() -> GitHub:
     """
     return GitHub(
         _resolve_token(),
-        timeout=_HTTP_TIMEOUT_SECONDS,
+        timeout=HTTP_TIMEOUT_SECONDS,
         ssl_verify=_build_ssl_context(),
         user_agent="pr-review-agent",
     )
@@ -140,7 +150,7 @@ def _raise_for_github_error(exc: Exception, context: str) -> GitHubApiError:
         )
     if isinstance(exc, RequestTimeout):
         return GitHubApiError(
-            f"Timed out after {_HTTP_TIMEOUT_SECONDS:.0f}s while fetching {context}."
+            f"Timed out after {HTTP_TIMEOUT_SECONDS:.0f}s while fetching {context}."
         )
     return GitHubApiError(f"Network error while fetching {context}: {redact(str(exc))}")
 
@@ -176,7 +186,7 @@ def resolve_repo(repo: str | None = None) -> tuple[str, str]:
         logger.debug("Resolved repo %s/%s from GITHUB_REPOSITORY", owner, name)
         return owner, name
 
-    local_origin = _origin_repo()
+    local_origin = origin_repo()
     if local_origin:
         owner, name = local_origin
         logger.debug("Resolved repo %s/%s from the `origin` remote", owner, name)
@@ -204,7 +214,7 @@ def get_pr_metadata(pr_number: int, repo: str | None = None) -> PullRequestMetad
             resolved, or the API call fails.
     """
     owner, name = resolve_repo(repo)
-    github = _client()
+    github = build_client()
     context = f"PR #{pr_number} in {owner}/{name}"
 
     try:
@@ -260,7 +270,7 @@ def get_pr_diff(pr_number: int, repo: str | None = None) -> str:
             resolved, or the API call fails.
     """
     owner, name = resolve_repo(repo)
-    github = _client()
+    github = build_client()
     context = f"the diff for PR #{pr_number} in {owner}/{name}"
 
     try:
@@ -275,6 +285,55 @@ def get_pr_diff(pr_number: int, repo: str | None = None) -> str:
     diff_text = response.text
     logger.info("Fetched diff for PR #%d (%d bytes)", pr_number, len(diff_text))
     return diff_text
+
+
+def get_file_at_ref(path: str, ref: str, repo: str | None = None) -> str | None:
+    """Fetch one repository file's contents as of `ref`.
+
+    Read through the contents API rather than the local checkout on purpose.
+    The review-input files (rules, lessons, criteria) steer the agent's system
+    prompt, so they must come from a ref the pull request's author cannot
+    write — the base branch — not from the PR-head checkout the workflow runs
+    in. Going through the API also means this works regardless of the
+    checkout's fetch depth, where `git show base:path` would fail on the
+    shallow clone `actions/checkout` produces by default.
+
+    Args:
+        path: Repository-relative POSIX path, e.g. `"AGENTS.md"`.
+        ref: The ref to read at, e.g. a base branch name or a commit SHA.
+        repo: Optional `OWNER/REPO` to target. When omitted, the repository is
+            resolved from `GITHUB_REPOSITORY` or the local `origin` remote.
+
+    Returns:
+        str | None: The file's contents, or None if it doesn't exist at `ref`.
+
+    Raises:
+        GitHubApiError: If no token is available, the repository cannot be
+            resolved, or the API call fails for any reason other than a 404.
+    """
+    owner, name = resolve_repo(repo)
+    github = build_client()
+    context = f"`{path}` at `{ref}` in {owner}/{name}"
+
+    try:
+        response = github.request(
+            "GET",
+            f"/repos/{owner}/{name}/contents/{path}",
+            params={"ref": ref},
+            headers={"Accept": _RAW_MEDIA_TYPE},
+        )
+    except RequestFailed as exc:
+        # A 404 is the ordinary "this repo has no AGENTS.md" case, which every
+        # caller treats as "omit that section", not as a failure.
+        if exc.response.status_code == 404:
+            logger.debug("%s does not exist", context)
+            return None
+        raise _raise_for_github_error(exc, context) from exc
+    except (RequestTimeout, RequestError) as exc:
+        raise _raise_for_github_error(exc, context) from exc
+
+    logger.debug("Fetched %s (%d bytes)", context, len(response.text))
+    return response.text
 
 
 def _git_output(args: list[str], cwd: Path | None = None) -> str | None:
@@ -319,7 +378,7 @@ def _git_output(args: list[str], cwd: Path | None = None) -> str | None:
     return result.stdout.strip()
 
 
-def _origin_repo(cwd: Path | None = None) -> tuple[str, str] | None:
+def origin_repo(cwd: Path | None = None) -> tuple[str, str] | None:
     """Resolve the `owner, name` pair from a checkout's `origin` remote.
 
     Args:
