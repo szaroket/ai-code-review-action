@@ -109,3 +109,92 @@ the CLI checks `ANTHROPIC_API_KEY` first — mitigated by a README warning,
 not code, since `cli.py` never touches these vars itself). A consumer that
 wants direct Anthropic billing is unaffected: `anthropic-api-key` alone still
 works exactly as before.
+
+**Two required-input files narrowed to optional/flexible during Phase 8
+(2026-07-31, user decisions).** Both reverse decisions `plan.md` had
+explicitly documented:
+- **`--rules-file` is now a soft dependency**, mirroring `--lessons-file`.
+  Not every consumer repo has an `AGENTS.md`; `load_rules_file` (Phase 4,
+  `agents_context.py`) now returns `None` and logs a warning on a missing
+  file instead of raising `FileNotFoundError`, and `build_system_prompt`
+  omits the "Repository Rules" section entirely when there's no content.
+  `cli.py`'s exit-`3` path (input-file errors) now only fires for
+  `--criteria-file`.
+- **Review criteria are no longer pinned to exactly five.** User's reasoning:
+  "it is specific per repo" — the number of criteria a discovery session
+  converges on shouldn't be a number this tool imposes on every consumer.
+  `load_review_criteria` (Phase 4) now requires only *at least one* `##`
+  heading; `InvalidReviewCriteriaError` fires only on zero. `criteria-file`
+  itself is still required — a review still needs some structured criteria to
+  score against.
+
+`plan.md` updated throughout: the "Prerequisite" section, two Key Decisions
+(the "five" bullet reworded to "Review criteria — sourcing methodology and no
+fixed count," plus a new "Rules-file is optional" bullet), Phase 4's
+`load_rules_file`/`load_review_criteria`/`build_system_prompt` descriptions,
+Phase 8's argparse spec and exit-code-contract step 3, Phase 6's
+`build_summary` description, Phase 10's `action.yml` description field,
+Testing Strategy steps 6-7, and the References entry for
+`review-criteria.md`. Verified directly: `load_review_criteria` accepts a
+single-criterion file and still rejects a zero-heading file;
+`build_system_prompt` omits "Repository Rules" when `rules_content` is
+`None` and includes it when non-empty. Full `pytest`/`ruff`/`pyright` gates
+re-run clean after both changes.
+
+**`--max-turns` default lowered from 15 to 5 (2026-07-31, user decision).**
+`cli.py`'s `_DEFAULT_MAX_TURNS` and Phase 10's `action.yml` draft default
+both updated to match.
+
+**Real bug found and fixed during Phase 8 manual `--publish` testing
+(2026-07-31): off-by-one line numbers caused a GitHub 422.** The user ran
+`--publish` against PR #1 successfully, then (per the post-failure Testing
+Strategy step) closed the PR and re-ran `--publish`, expecting a clean
+rejection. Instead got `HTTP 422: "Line could not be resolved"`. Reopening
+PR #1 and re-running the identical command reproduced the *same* 422 on an
+**open** PR — proving the failure had nothing to do with the PR being
+closed. Inspecting the written JSON artifact showed the model had submitted
+a finding at `line: 11`, but PR #1's only hunk (`@@ -6,3 +6,5 @@`) only
+spans new-file lines 6-10; line 11 doesn't exist. Root cause: `hunks_text`
+(the diff text shown to the model) was plain unified-diff text — line
+numbers only appear once, in the `@@ -a,b +c,d @@` header — so the model had
+to count lines itself to know what number to put in `submit_finding`, and
+miscounted by one.
+
+**Fix**: `diff_parser._render_hunk` now prefixes every hunk line with its
+exact `old_line new_line` pair (`.` for the side that has none, e.g. an
+added line has no old_line), so the model reads the number directly instead
+of counting. `agents_context._SUBMIT_FINDING_CONTRACT` was updated to
+describe the annotation format and instruct the model to use it verbatim,
+"never count lines yourself." Verified the fix directly: re-fetching PR #1's
+diff now renders `.      9 +` / `.     10 +<!-- throwaway... -->` for the
+added lines; a manually-built `Finding(path="README.md", line=10,
+side=RIGHT, ...)` posted successfully via `post_review` (confirmed live on
+GitHub, anchored to the correct line), whereas `line=11` is exactly what had
+failed before. All of Phase 2's existing tests (`tests/test_diff_parser.py`)
+still pass unchanged — they measure `hunks_text` length/membership
+dynamically rather than asserting a fixed raw-diff string, so the format
+change didn't need any test rewrites. Full `pytest`/`ruff`/`pyright` gates
+re-run clean. `plan.md`'s Phase 2 section updated with this fix, tagged to
+Phase 8 since that's when it surfaced.
+
+**Closed/merged-PR guard added (2026-07-31, user decision).** After the fix
+above, the user re-tested the post-failure path against the closed PR #1 and
+found it was no longer a failure at all — the review ran and the comment
+published successfully to a *closed* PR. Their feedback: reviewing (and
+posting to) a PR nobody can act on anymore is wasted work, and the tool
+should check PR state up front and stop, not just happen to succeed or fail
+depending on whether GitHub allows the API call. `PullRequestMetadata`
+(`github_diff.py`) gained `state: str` and `merged: bool` fields, populated
+directly from `pulls.get`'s response. `cli.py`'s `main_async` now fetches PR
+metadata, checks `state != "open"` **immediately** — before fetching the
+diff, before loading any files, before the agent ever runs — and if closed
+or merged, prints "PR #<n> is closed/merged; skipping review" and exits `0`
+(the same benign-skip pattern as the zero-changed-files and scope guards).
+Verified live against PR #1 (currently closed, left that way per the user):
+the run exits `0` immediately after the metadata fetch, with no diff fetch,
+no agent invocation, and no publish attempt in the logs. `plan.md`'s Phase 8
+exit-code-contract list and Phase 3's `PullRequestMetadata` description both
+updated; the contract's steps were renumbered 1-12 to insert this as step 2.
+Full `pytest`/`ruff`/`pyright` gates re-run clean; no test file constructs
+`PullRequestMetadata` directly, so no existing tests needed updating for the
+two new required fields.

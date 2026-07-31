@@ -100,10 +100,14 @@ itself.
 Any repo that wants to use this action — including this repo itself, for
 its own dogfood workflow (Phase 12) — must first run a **separate, fresh
 conversation** (not a planning session) about what good code review and PR
-acceptance look like *for that repo's stack*, converging on exactly **five
-concrete criteria**. AI can help surface ecosystem-typical practices, but
-the requirements predate the tool; the user's judgment is the essential
-input, the AI's job is to help structure it.
+acceptance look like *for that repo's stack*, converging on a small, focused
+set of **concrete criteria**. *(Originally scoped to exactly five; narrowed
+during Phase 8 implementation, user decision 2026-07-31 — see the "Review
+criteria — no fixed count" Key Decision below. How many criteria make sense
+is each repo's own call, not a number this tool should impose.)* AI can help
+surface ecosystem-typical practices, but the requirements predate the tool;
+the user's judgment is the essential input, the AI's job is to help
+structure it.
 
 Output: a markdown file (path is the caller's choice, passed as the
 `criteria-file` input) shaped like:
@@ -117,13 +121,13 @@ Output: a markdown file (path is the caller's choice, passed as the
 ## <Criterion 2 name>
 ...
 
-(exactly five `##` sections total)
+(one `##` section per criterion; however many the discovery session converges on)
 ```
 
 `load_review_criteria` (Phase 4) parses `##` headings as names and raises a
-clear error if the count isn't exactly five — this is what enforces the
+clear error only if there are none at all — this is what enforces the
 discovery session actually happened, for whichever repo is consuming the
-action.
+action, without dictating how many criteria that session must produce.
 
 **For this repo's own dogfooding** (Phase 12), we run this session ourselves
 and commit our own `context/foundation/review-criteria.md`. That path is this
@@ -233,10 +237,18 @@ criterion here waits on it or references it.
   `actions/upload-artifact@v4` with `if: always()` so findings survive a
   red job — the standard `upload-artifact` pattern for preserving output
   from a failing job.
-- **Five review criteria — sourcing methodology:** per-consumer discovery
-  session (see "Prerequisite" above), not mechanically distilled by this
-  tool's code from any one repo's docs. `criteria-file` is a **required
-  input with no default** — every repo names/locates this file differently.
+- **Review criteria — sourcing methodology and no fixed count.** Sourced via
+  a per-consumer discovery session (see "Prerequisite" above), not
+  mechanically distilled by this tool's code from any one repo's docs.
+  `criteria-file` is a **required input with no default** — every repo
+  names/locates this file differently. *(Narrowed during Phase 8
+  implementation, user decision 2026-07-31: the file originally had to
+  contain exactly five `##` criteria; that count is now the consumer's own
+  choice — `load_review_criteria` only requires at least one. Reasoning: "it
+  is specific per repo," and a fixed number one repo happened to converge on
+  has no reason to generalize to every consumer's stack. `criteria-file`
+  itself stays required — a review still needs *some* structured criteria to
+  score against, just not exactly five of them.)*
 - **Criterion score scale:** `pass` / `fail` / `not_applicable` per
   criterion, plus one `overall_verdict` (`APPROVE`/`REQUEST_CHANGES`/
   `COMMENT`, matching `ReviewOutput.event`'s casing directly). Rejected: a
@@ -252,6 +264,15 @@ criterion here waits on it or references it.
   one repo's `AGENTS.md` into named categories ("Backend Layer Boundaries",
   etc.) baked into this tool's code. That's repo-specific and can't survive
   genericization — see Phase 4 and "What We're NOT Doing."
+- **Rules-file is optional, not a hard requirement.** *(Narrowed during
+  Phase 8 implementation, user decision 2026-07-31, superseding Phase 4's
+  original "hard requirement" framing.)* Not every consumer repo has an
+  `AGENTS.md` (or whatever `--rules-file` points at). `load_rules_file` now
+  behaves like `load_lessons_file` — missing is a warning, not a
+  `FileNotFoundError`, and `build_system_prompt` omits the "Repository
+  Rules" section entirely when there's no content. `criteria-file` remains
+  the one file whose absence is fatal (exit `3`); a review can proceed with
+  nothing but the loaded criteria and the diff itself.
 
 ## What We're NOT Doing
 
@@ -336,7 +357,7 @@ ai-code-review-action/              (this repo's root — the action itself)
   context/
     foundation/
       README.md
-      review-criteria.md            # this repo's own 5 criteria (Phase 12 prerequisite)
+      review-criteria.md            # this repo's own review criteria (Phase 12 prerequisite)
     changes/ai-code-review/
       change.md, first-research.md, plan.md   # this plan, moved here
     archive/README.md
@@ -448,6 +469,18 @@ dependency.
   format from GitHub's raw patch output) must not crash the parse. Catch the
   binary case per-file and emit a `ChangedFile` with empty line-number
   lists and `hunks_text = "[binary file, diff not shown]"`.
+- **Line-annotated `hunks_text`** *(fixed during Phase 8 manual testing,
+  2026-07-31 — see change.md for the full incident)*. Plain `str(hunk)`
+  (raw unified-diff text) carries line numbers only in the `@@ -a,b +c,d @@`
+  header, forcing the reviewing model to count lines itself — and it
+  miscounted by one on a real `--publish` run, submitting a finding for a
+  line that didn't exist in the diff at all, which GitHub's reviews API
+  rejected with a 422 ("Line could not be resolved") regardless of whether
+  the PR was open or closed. `_render_hunk` now prefixes every hunk line
+  with its exact `old_line new_line` pair (`.` when a side has no line
+  there), so the model reads `line` directly instead of counting;
+  `agents_context._SUBMIT_FINDING_CONTRACT` was updated to describe the
+  annotation and tell the model to use it verbatim.
 
 **Test plan:** `tests/fixtures/sample.diff` covers 5 cases in one diff: a
 modified file (added+removed lines in one hunk), an added file, a renamed
@@ -480,7 +513,9 @@ in Phase 8 governs *review output*, not logs.
 package as typed.
 
 Plain code, no agent. `GitHubApiError(RuntimeError)`; `PullRequestMetadata`
-dataclass; `resolve_repo(repo=None) -> tuple[str, str]`;
+dataclass (adds `state`/`merged` fields — *added during Phase 8 manual
+testing, user decision 2026-07-31*, so `cli.py` can skip a closed/merged PR
+before fetching its diff); `resolve_repo(repo=None) -> tuple[str, str]`;
 `get_pr_metadata(pr_number, repo=None)` via `pulls.get` + paginated
 `pulls.list_files`; `get_pr_diff(pr_number, repo=None)` via the raw-patch
 media type (see "GitHub transport" under Key Decisions).
@@ -535,14 +570,17 @@ consume it rather than participate in its tests.
 
 ## Phase 4: agents_context.py
 
-`load_rules_file(path) -> str` reads the file at the given path, raises
-clear `FileNotFoundError` if missing (hard requirement); `load_lessons_file
-(path) -> str | None` reads the given path, returns `None` if the path
-wasn't provided or the file is missing (soft dependency).
-`load_review_criteria(path) -> list[Criterion]` parses `##` headings from
-the given path as described in "Prerequisite" above; raises
+`load_rules_file(path) -> str | None` reads the file at the given path,
+returns `None` if missing, logging a warning (soft dependency — *narrowed
+during Phase 8 implementation, user decision 2026-07-31, from the originally
+planned hard requirement*: not every consumer repo has an `AGENTS.md`);
+`load_lessons_file(path) -> str | None` reads the given path, returns `None`
+if the path wasn't provided or the file is missing (soft dependency, always
+was). `load_review_criteria(path) -> list[Criterion]` parses `##` headings
+from the given path as described in "Prerequisite" above; raises
 `FileNotFoundError` if missing, `InvalidReviewCriteriaError(ValueError)` if
-the count isn't exactly five.
+there are zero `##` headings (*narrowed the same day from "exactly five" —
+see the "Review criteria — no fixed count" Key Decision*).
 
 **No hardcoded per-stack categories this time** (the key change from the
 original single-repo design): `rules_content` and
@@ -554,11 +592,12 @@ arbitrary consumer repos.
 `build_system_prompt(rules_content, lessons_content, criteria:
 list[Criterion])` composes, in order: role statement (review ONLY the
 diff, never fix code, never modify files) → a **"Review Criteria"** section
-listing the five `criteria` verbatim (name + description each), with an
+listing the loaded `criteria` verbatim (name + description each), with an
 instruction that these are the axis `submit_review_verdict` must score, by
-exact name → a **"Repository Rules"** section with `rules_content` verbatim
-→ (if present) an **"Additional Lessons / Pitfalls"** section with
-`lessons_content` verbatim → tool-usage guidance (Read/Grep/Glob only for
+exact name → (if present) a **"Repository Rules"** section with
+`rules_content` verbatim → (if present) an **"Additional Lessons /
+Pitfalls"** section with `lessons_content` verbatim → tool-usage guidance
+(Read/Grep/Glob only for
 context strictly around changed lines) → `submit_finding` contract (one
 call per issue, cite something from "Repository Rules"/"Additional Lessons"
 in `rule_reference` when possible) → `submit_review_verdict` contract: call
@@ -623,7 +662,7 @@ Adds `claude-agent-sdk` dependency.
 `deduplicate_findings` (exact `(path, line, comment)` match,
 first-occurrence order), `cap_findings(findings, max_findings) -> (kept,
 was_capped)`, `build_summary(findings, verdict)` — deterministic summary
-built entirely in code: renders the five `CriterionScore`s first (e.g.
+built entirely in code: renders the `CriterionScore`s first (e.g.
 `"✅ <name>: pass — <rationale>"`), then the findings-count breakdown.
 `build_review_output(pr_number, findings, verdict)` — `event` comes
 directly from `verdict.overall_verdict` (no severity-rollup heuristic; the
@@ -668,11 +707,13 @@ Testing Strategy) — no live-API mocking this iteration.
 
 `argparse`: `--pr` (required int), `--repo` (now routinely needed, not
 optional-in-practice), `--rules-file` (default `"AGENTS.md"` — a common
-convention, but overridable since not every repo uses that name),
+convention, but overridable since not every repo uses that name; **optional
+file** — missing is a warning, not an error, since not every repo has one),
 `--criteria-file` (**required, no default**), `--lessons-file` (optional,
 no default), `--scope-dirs` (repeatable, **no default** — omitted means "no
 filtering"), `--model` (default `claude-opus-5`), `--max-turns` (default
-15), `--max-findings` (default 30), `--exclude` (repeatable, default
+5 — *lowered from 15, user decision 2026-07-31*), `--max-findings` (default
+30), `--exclude` (repeatable, default
 `[]` — the earlier repo-specific defaults like
 `backend/migrations/*` don't generalize; a consumer sets its own), `--out-
 dir` (default `./review-output`), `--format {console,json,markdown,all}`
@@ -693,41 +734,53 @@ scope. Unit tested in `tests/test_cli.py`.
 
 `main_async` orchestration, exit-code contract:
 
-1. Fetch metadata+diff; `GitHubApiError` → stderr message, exit `2`.
-2. **Zero-changed-files guard**: no changed files at all → print "nothing
+1. Fetch PR metadata; `GitHubApiError` → stderr message, exit `2`.
+2. **Closed/merged-PR guard** *(added during Phase 8 manual testing, user
+   decision 2026-07-31 — see change.md)*: if `pr_metadata.state != "open"`,
+   print "PR #<n> is closed/merged; skipping review," exit `0` — **before**
+   the diff is even fetched, let alone the agent invoked. Nobody can act on
+   review feedback for a PR that's already closed or merged; posting one is
+   wasted API/token cost at best and a stray comment on a dead PR at worst.
+   Checked first, ahead of every other guard, since it's the cheapest to
+   evaluate (needs only the metadata call already made in step 1).
+3. Fetch the diff; `GitHubApiError` → stderr message, exit `2`.
+4. **Zero-changed-files guard**: no changed files at all → print "nothing
    to review", exit `0` without invoking the agent.
-3. Load `--rules-file`, `--lessons-file` (if given), `--criteria-file`.
-   `FileNotFoundError` (missing rules-file or criteria-file) or
+5. Load `--rules-file`, `--lessons-file` (if given), `--criteria-file`.
+   Only `--criteria-file` is a hard requirement: its `FileNotFoundError` or
    `InvalidReviewCriteriaError` → stderr message naming which file/problem,
-   exit `3`. A missing/unset lessons-file is not an error.
-4. Parse diff into `ChangedFile`s, apply `filter_in_scope_files` (no-op if
+   exit `3`. A missing/unset rules-file or lessons-file is not an error —
+   both are soft dependencies (*rules-file narrowed from a hard requirement
+   during Phase 8 implementation, user decision 2026-07-31*); the
+   corresponding prompt section is simply omitted.
+6. Parse diff into `ChangedFile`s, apply `filter_in_scope_files` (no-op if
    `scope-dirs` wasn't set). **Scope guard**: if `scope-dirs` was set and
    `in_scope` ends up empty, print "N files out of scope," exit `0` without
    invoking the agent.
-5. Build diff context from `in_scope`, build the system prompt from the
+7. Build diff context from `in_scope`, build the system prompt from the
    three loaded inputs.
-6. Run the agent; SDK exception (e.g. missing `ANTHROPIC_API_KEY`) → stderr
+8. Run the agent; SDK exception (e.g. missing `ANTHROPIC_API_KEY`) → stderr
    message, exit `4`.
-7. Dedup + cap findings, build `ReviewOutput` from `(findings, verdict)`,
+9. Dedup + cap findings, build `ReviewOutput` from `(findings, verdict)`,
    write requested format(s) to disk. **This happens before the verdict
    check, not after** — same principle as the "Post-failure handling"
    decision and Risk #8: artifacts land before anything that can fail, so
    findings survive a red job.
-8. Non-success run (SDK status, or missing/invalid verdict) → exit `5`,
-   *with artifacts already written from step 7*. Risk #5 makes this the
-   most likely failure mode, and an agent that submitted twenty good
-   findings but never landed a valid `submit_review_verdict` (hit
-   `max_turns`, or every attempt failed Phase 5's exact-name-match
-   validation) must not lose them. On this path `ReviewOutput.verdict` is
-   `None`, `event` falls back to `"COMMENT"` (see Phase 6), and the console
-   and markdown output carry an explicit `"=== INCOMPLETE — NO VERDICT
-   PRODUCED ==="` banner. **Never publish on this path**, regardless of
-   `--publish`.
-9. If `--publish`: call `github_publish.post_review(...)`. `GitHubPublishError`
-   → stderr message noting local artifacts are saved, exit `6`. On success,
-   console confirms "Posted N inline comments to PR #<n>" (no dry-run
-   banner).
-10. Else: print the existing dry-run console/JSON/markdown output, exit `0`.
+10. Non-success run (SDK status, or missing/invalid verdict) → exit `5`,
+    *with artifacts already written from step 9*. Risk #5 makes this the
+    most likely failure mode, and an agent that submitted twenty good
+    findings but never landed a valid `submit_review_verdict` (hit
+    `max_turns`, or every attempt failed Phase 5's exact-name-match
+    validation) must not lose them. On this path `ReviewOutput.verdict` is
+    `None`, `event` falls back to `"COMMENT"` (see Phase 6), and the console
+    and markdown output carry an explicit `"=== INCOMPLETE — NO VERDICT
+    PRODUCED ==="` banner. **Never publish on this path**, regardless of
+    `--publish`.
+11. If `--publish`: call `github_publish.post_review(...)`. `GitHubPublishError`
+    → stderr message noting local artifacts are saved, exit `6`. On success,
+    console confirms "Posted N inline comments to PR #<n>" (no dry-run
+    banner).
+12. Else: print the existing dry-run console/JSON/markdown output, exit `0`.
 
 README covers: setup (`uv sync`, `ANTHROPIC_API_KEY`, never commit it), the
 `criteria-file` prerequisite (link to "Prerequisite" section), usage
@@ -783,7 +836,7 @@ less.
 
 ```yaml
 name: "AI PR Code Review"
-description: "Reviews a PR's diff against caller-supplied rules and five review criteria, using Claude."
+description: "Reviews a PR's diff against caller-supplied rules and review criteria, using Claude."
 inputs:
   pr-number: { required: true }
   repo: { required: false }
@@ -793,7 +846,7 @@ inputs:
   scope-dirs: { required: false }
   exclude: { required: false }
   model: { required: false, default: "claude-opus-5" }
-  max-turns: { required: false, default: "15" }
+  max-turns: { required: false, default: "5" }
   max-findings: { required: false, default: "30" }
   format: { required: false, default: "console" }
   publish: { required: false, default: "false" }
@@ -1034,14 +1087,21 @@ keep it cheap.
    regression): exit `3`, criteria file not found. This is the only check
    that can distinguish `--project` from `--directory`; the `dogfood` job's
    `uses: ./` cannot.
-6. Confirm the criteria-file guard: rename/malform a criteria file (wrong
-   `##` count) → exit `3` with a specific error.
+6. Confirm the criteria-file guard: point at a file with zero `##` headings
+   → exit `3` with a specific error.
 7. Confirm `--publish` end-to-end against a real scratch PR: inline
    comments anchored to correct lines (spot-check against `gh pr diff
    --patch`), local artifacts still written, summary body includes all
-   five criteria with ratings and rationale.
-8. Confirm the post-failure path (unauthenticated `GH_TOKEN`, or a closed
-   PR) → exit `6`, artifacts preserved.
+   loaded criteria with ratings and rationale.
+8. Confirm the post-failure path (e.g. an unauthenticated/insufficiently
+   scoped `GH_TOKEN`) → exit `6`, artifacts preserved. *(Originally also
+   listed "a closed PR" as a trigger for this path; superseded 2026-07-31 —
+   the closed/merged-PR guard now intercepts that case earlier and exits `0`
+   before publishing is ever attempted, see step 8b and change.md.)*
+8b. Confirm the closed/merged-PR guard (added 2026-07-31): running against a
+    closed PR prints "PR #<n> is closed/merged; skipping review" and exits
+    `0`, with no diff fetch, no agent invocation, and no publish attempt in
+    the logs.
 9. Confirm exit codes: a bogus `--pr` → exit `2` with a clear `gh` error.
 
 ## Follow-up / Out of Scope for This Plan
@@ -1074,7 +1134,7 @@ keep it cheap.
   detail lives here
 - `pyproject.toml` — dependency/tooling setup
 - `.github/workflows/self-test.yml` — the course assignment's evidence path
-- `context/foundation/review-criteria.md` — this repo's own five criteria
+- `context/foundation/review-criteria.md` — this repo's own review criteria
   (prerequisite for Phase 12)
 
 ## Progress
@@ -1151,12 +1211,13 @@ keep it cheap.
 
 #### Automated
 
-- [ ] 8.1 `uv run pytest tests/test_cli.py -v` passes (scope filter unit tests)
+- [x] 8.1 `uv run pytest tests/test_cli.py -v` passes (scope filter unit tests)
 
 #### Manual
 
-- [ ] 8.2 Exit-code contract smoke test per Testing Strategy step 9
-- [ ] 8.3 `--publish` and post-failure smoke tests per Testing Strategy steps 7-8
+- [x] 8.2 Exit-code contract smoke test per Testing Strategy step 9
+- [x] 8.3 `--publish` and post-failure smoke tests per Testing Strategy steps 7-8
+- [x] 8.4 Closed/merged-PR guard confirmed live per Testing Strategy step 8b (exit `0`, no diff fetch, no agent run, no publish attempt)
 
 ### Phase 9: final pyproject.toml
 

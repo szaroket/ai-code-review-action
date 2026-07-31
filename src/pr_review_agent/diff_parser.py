@@ -8,7 +8,7 @@ from fnmatch import fnmatch
 # the root re-exports these without declaring them public, which pyright flags
 # as reportPrivateImportUsage.
 from unidiff.constants import RE_PATCH_FILE_PREFIX
-from unidiff.patch import PatchedFile, PatchSet
+from unidiff.patch import Hunk, PatchedFile, PatchSet
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,12 @@ _FILE_LIST_TAIL = "... and {count} more file(s)\n"
 
 @dataclass(frozen=True)
 class ChangedFile:
-    """One file touched by a diff, with its hunks and changed line numbers."""
+    """One file touched by a diff, with its hunks and changed line numbers.
+
+    `hunks_text` renders each line pre-annotated with its exact old/new line
+    number (see `_render_hunk`) so a reviewing model can read a line number
+    directly instead of counting from the `@@ -a,b +c,d @@` header.
+    """
 
     path: str
     is_added: bool
@@ -43,6 +48,37 @@ def _strip_vcs_prefix(filepath: str) -> str:
     if RE_PATCH_FILE_PREFIX.match(filepath):
         return filepath[2:]
     return filepath
+
+
+def _render_hunk(hunk: Hunk) -> str:
+    """Render one hunk with its exact old/new line number on every line.
+
+    Plain `str(hunk)` (the unidiff default) reproduces the raw unified-diff
+    text, which carries line numbers only in the `@@ -a,b +c,d @@` header —
+    a reviewing model has to count from there to know which line a change is
+    on, and an off-by-one miscount there is exactly what caused a real
+    GitHub 422 ("Line could not be resolved"): the model submitted a finding
+    for a line that didn't exist in the diff at all. Annotating every line
+    with its resolved number removes the counting step entirely.
+
+    Args:
+        hunk: One hunk from a `unidiff` patched file.
+
+    Returns:
+        str: The `@@ ... @@` header, then one `old new marker content` line
+        per line in the hunk. `.` marks the side that has no line there
+        (e.g. an added line has no old-file line number).
+    """
+    header = (
+        f"@@ -{hunk.source_start},{hunk.source_length} "
+        f"+{hunk.target_start},{hunk.target_length} @@"
+    )
+    lines = [header]
+    for line in hunk:
+        old = str(line.source_line_no) if line.source_line_no is not None else "."
+        new = str(line.target_line_no) if line.target_line_no is not None else "."
+        lines.append(f"{old:>6} {new:>6} {line.line_type}{line.value.rstrip(chr(10))}")
+    return "\n".join(lines) + "\n"
 
 
 def _changed_file_from_patched_file(patched_file: PatchedFile) -> ChangedFile:
@@ -76,7 +112,7 @@ def _changed_file_from_patched_file(patched_file: PatchedFile) -> ChangedFile:
     removed_line_numbers: list[int] = []
     hunk_texts: list[str] = []
     for hunk in patched_file:
-        hunk_texts.append(str(hunk))
+        hunk_texts.append(_render_hunk(hunk))
         for line in hunk:
             # `unidiff` types both line numbers as Optional[int]: the target
             # number is None on removed lines and vice versa. Narrow rather
