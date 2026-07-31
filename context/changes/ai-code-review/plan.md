@@ -193,15 +193,40 @@ criterion here waits on it or references it.
   inline comments anchored to the diff (the whole point). Rejected:
   `gh pr review --body <summary>` (loses inline anchoring), and a
   summary-only comment.
-- **Auth tokens are consumer-supplied inputs**, not hardcoded: `anthropic-
-  api-key` and `github-token` inputs, mapped to `ANTHROPIC_API_KEY`/
-  `GH_TOKEN` env vars for the underlying `gh`/SDK calls. A consuming
-  workflow typically passes `github-token: ${{ github.token }}` (its own
-  default `GITHUB_TOKEN`, `permissions: pull-requests: write`) and
-  `anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}` (its own secret).
+- **Auth tokens are consumer-supplied inputs**, not hardcoded: `github-token`
+  input, mapped to `GH_TOKEN` for the underlying SDK/githubkit calls. A
+  consuming workflow typically passes `github-token: ${{ github.token }}`
+  (its own default `GITHUB_TOKEN`, `permissions: pull-requests: write`).
   Known limitation, inherited by every consumer: a `pull_request` event
   from a **fork** gets a read-only default token, so `publish: true` will
   fail there regardless of which repo is consuming the action.
+- **Anthropic auth supports a direct key *or* an Anthropic-API-compatible
+  gateway — OpenRouter, concretely.** *(Decision made 2026-07-31, mid-Phase-5,
+  at the user's request: their only funded billing account is OpenRouter, not
+  the Anthropic Console, and they want that to be the action's supported path
+  going forward, not just a local dev-time workaround.)* Three inputs instead
+  of one required key: `anthropic-api-key` (optional now, was required),
+  `anthropic-base-url`, `anthropic-auth-token` — mapped to `ANTHROPIC_API_KEY`
+  / `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` respectively. This is
+  **zero-code-change** in `review_agent.py`: verified directly against the
+  installed `claude-agent-sdk` (0.2.128) source
+  (`_internal/transport/subprocess_cli.py`) that the bundled Claude Code CLI
+  subprocess is launched with `inherited_env = os.environ` merged under
+  `ClaudeAgentOptions.env` — so whichever of these three vars the *process*
+  running `pr-review-agent` sees, the CLI subprocess sees too, with no SDK
+  option carrying an API key or base URL directly. The three-env-var pattern
+  (`ANTHROPIC_BASE_URL=https://openrouter.ai/api`,
+  `ANTHROPIC_AUTH_TOKEN=<key>`, `ANTHROPIC_API_KEY=""`) is OpenRouter's own
+  documented Claude-Code-compatibility path, not a hack.
+  A consumer that wants direct Anthropic billing still passes only
+  `anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}`, unchanged from
+  before. This repo's own dogfood workflow (Phase 12) uses the OpenRouter
+  path with a repo secret named `OPENROUTER_API_KEY`. Trade-off accepted:
+  `anthropic-api-key` moving from `required: true` to optional means a
+  consumer who sets none of the three inputs no longer gets an immediate
+  GitHub Actions input-validation error — the failure surfaces slightly
+  later, as an auth error from the Claude Code CLI subprocess itself once the
+  agent step runs.
 - **Post-failure handling:** local artifacts are written *before* attempting
   the post; a failed post exits a distinct code (`6`) rather than silently
   succeeding. A consuming workflow uploads `review-output/` via
@@ -708,7 +733,13 @@ README covers: setup (`uv sync`, `ANTHROPIC_API_KEY`, never commit it), the
 `criteria-file` prerequisite (link to "Prerequisite" section), usage
 example with all the now-required inputs spelled out, `--publish` and its
 warning, the fork-PR limitation, and that there is no default `scope-dirs`
-or `exclude` list anymore — every consumer sets its own.
+or `exclude` list anymore — every consumer sets its own. **Also covers the
+Anthropic auth choice**: either `anthropic-api-key` alone, or
+`anthropic-base-url` + `anthropic-auth-token` together for an
+Anthropic-API-compatible gateway (OpenRouter is the worked example, since
+that's this repo's own dogfood setup in Phase 12) — with an explicit warning
+against setting both, since a non-empty `ANTHROPIC_API_KEY` wins over
+`ANTHROPIC_AUTH_TOKEN` and silently defeats gateway routing.
 
 ## Phase 9: final pyproject.toml
 
@@ -767,7 +798,9 @@ inputs:
   format: { required: false, default: "console" }
   publish: { required: false, default: "false" }
   out-dir: { required: false, default: "./review-output" }
-  anthropic-api-key: { required: true }
+  anthropic-api-key: { required: false, default: "" }
+  anthropic-base-url: { required: false, default: "" }
+  anthropic-auth-token: { required: false, default: "" }
   github-token: { required: true }
 runs:
   using: "composite"
@@ -780,6 +813,8 @@ runs:
       shell: bash
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        ANTHROPIC_BASE_URL: ${{ inputs.anthropic-base-url }}
+        ANTHROPIC_AUTH_TOKEN: ${{ inputs.anthropic-auth-token }}
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
         uv run --project "${{ github.action_path }}" pr-review-agent \
@@ -806,6 +841,20 @@ plan, and a consumer that sets it while the run step drops it would get
 every changed file reviewed with no error — and a consumer overriding
 `out-dir` would upload an empty artifact directory in its `if: always()`
 step.
+
+**The three Anthropic auth inputs go straight into `env:`, unconditionally,
+with empty-string defaults — deliberately not the `format(...)`-fallback
+form the optional CLI-flag inputs use.** These three were never going to
+become CLI flags (the SDK reads them from the process environment, not
+`cli.py`'s argparse — see the "Anthropic auth" Key Decision), so there is no
+`--flag` to conditionally omit; an empty string env var is simply absent to
+the CLI subprocess. A consumer sets exactly one pair: `anthropic-api-key`
+alone (direct Anthropic billing), or `anthropic-base-url` +
+`anthropic-auth-token` together (OpenRouter or another Anthropic-API-
+compatible gateway) — mixing both leaves `ANTHROPIC_API_KEY` non-empty,
+which the Claude Code CLI checks before `ANTHROPIC_AUTH_TOKEN`, silently
+defeating the gateway routing. Worth a explicit README callout, not just an
+implicit convention.
 
 **Critical detail** (see also Risks/Mitigations): use `uv run --project
 "${{ github.action_path }}"`, **never** `--directory`. `--project` points
@@ -847,11 +896,14 @@ Workflow: triggers on `pull_request` to this repo, `permissions: contents:
 read, pull-requests: write`, uses **this repo's own action via a local
 path** (`uses: ./` — valid for an action referencing itself from within its
 own repo) with `rules-file: AGENTS.md`, `criteria-file:
-context/foundation/review-criteria.md`, `anthropic-api-key: ${{
-secrets.ANTHROPIC_API_KEY }}` (a **repo secret the user must add manually**
-in this repo's GitHub settings — not something set via CLI here),
-`github-token: ${{ github.token }}`, `publish: true`. Uploads
-`review-output/` via `actions/upload-artifact@v4` with `if: always()`.
+context/foundation/review-criteria.md`, `anthropic-base-url:
+"https://openrouter.ai/api"`, `anthropic-auth-token: ${{
+secrets.OPENROUTER_API_KEY }}` (a **repo secret the user must add manually**
+in this repo's GitHub settings — not something set via CLI here; see the
+"Anthropic auth" Key Decision for why this repo's own dogfood routes through
+OpenRouter rather than a direct Anthropic key), `github-token: ${{
+github.token }}`, `publish: true`. Uploads `review-output/` via
+`actions/upload-artifact@v4` with `if: always()`.
 
 This is the **simplest path to the course assignment's three deliverables**
 (visible pipeline job, live logs, real PR comment) — it's entirely
@@ -884,7 +936,8 @@ so `--project` and `--directory` are behaviorally identical and the top risk
           criteria-file: _fixture/criteria.md
           rules-file: AGENTS.md
           model: claude-haiku-4-5
-          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic-base-url: "https://openrouter.ai/api"
+          anthropic-auth-token: ${{ secrets.OPENROUTER_API_KEY }}
           github-token: ${{ github.token }}
           # publish deliberately omitted — dry run only
 ```
@@ -943,13 +996,24 @@ keep it cheap.
     — a deliberate simplification (see Current State Analysis), not a
     regression: those categories only ever made sense for one specific
     FastAPI/React stack.
+11. **Two Anthropic auth env vars set at once** (`ANTHROPIC_API_KEY`
+    non-empty *and* `anthropic-base-url`/`anthropic-auth-token` set) — the
+    Claude Code CLI checks `ANTHROPIC_API_KEY` first, so the gateway is
+    silently bypassed rather than erroring. Mitigated by an explicit README
+    warning (Phase 8) rather than code-level validation, since `cli.py` never
+    touches these vars itself — they reach the CLI subprocess purely via
+    inherited process environment (see the "Anthropic auth" Key Decision).
 
 ## Testing Strategy / Verification
 
 1. `uv sync`; `uv run pytest -v` — all `diff_parser.py`, `test_cli.py`,
    `output.py` tests pass.
 2. `uv run ruff check . && uv run ruff format --check . && uv run pyright`.
-3. Export `ANTHROPIC_API_KEY` (never commit it).
+3. Export either `ANTHROPIC_API_KEY`, or `ANTHROPIC_BASE_URL` +
+   `ANTHROPIC_AUTH_TOKEN` for an Anthropic-API-compatible gateway (this
+   developer's own runs use OpenRouter: `ANTHROPIC_BASE_URL=
+   https://openrouter.ai/api`, `ANTHROPIC_AUTH_TOKEN=<OpenRouter key>`,
+   `ANTHROPIC_API_KEY=""` — never commit any of these).
 4. **Recommended evidence path for the course assignment — entirely within
    this repo**: complete this repo's own discovery session (Phase 12
    prerequisite), write its `review-criteria.md` and a minimal `AGENTS.md`,
