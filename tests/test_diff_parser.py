@@ -60,6 +60,16 @@ def test_removed_file_has_no_added_lines(sample_files: list[ChangedFile]) -> Non
     assert removed.removed_line_numbers == [1, 2]
 
 
+def test_removed_file_hunks_text_is_placeholder(
+    sample_files: list[ChangedFile],
+) -> None:
+    """A deleted file's body is never rendered — nothing left to review."""
+    removed = _by_path(sample_files, "to_remove.py")
+    assert (
+        removed.hunks_text == "[file deleted, contents not shown — nothing to review]"
+    )
+
+
 def test_renamed_file_captures_source_path(sample_files: list[ChangedFile]) -> None:
     renamed = _by_path(sample_files, "new_name.py")
     assert renamed.is_renamed

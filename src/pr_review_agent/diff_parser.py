@@ -13,6 +13,7 @@ from unidiff.patch import Hunk, PatchedFile, PatchSet
 logger = logging.getLogger(__name__)
 
 _BINARY_PLACEHOLDER = "[binary file, diff not shown]"
+_REMOVED_FILE_PLACEHOLDER = "[file deleted, contents not shown — nothing to review]"
 _FILE_LIST_HEADER = "Changed files:\n"
 _FILE_LIST_TAIL = "... and {count} more file(s)\n"
 
@@ -23,7 +24,10 @@ class ChangedFile:
 
     `hunks_text` renders each line pre-annotated with its exact old/new line
     number (see `_render_hunk`) so a reviewing model can read a line number
-    directly instead of counting from the `@@ -a,b +c,d @@` header.
+    directly instead of counting from the `@@ -a,b +c,d @@` header. For a
+    fully deleted file it is a placeholder instead — there is no new code
+    left to review, and rendering the whole deleted body would burn the
+    diff-context budget on content nothing can act on.
     """
 
     path: str
@@ -112,7 +116,12 @@ def _changed_file_from_patched_file(patched_file: PatchedFile) -> ChangedFile:
     removed_line_numbers: list[int] = []
     hunk_texts: list[str] = []
     for hunk in patched_file:
-        hunk_texts.append(_render_hunk(hunk))
+        # A fully deleted file has nothing left to review — skip rendering
+        # its (potentially large) body; the placeholder below replaces it.
+        # Line numbers are still collected: cheap, and keeps ChangedFile's
+        # shape uniform regardless of which branch below is used.
+        if not patched_file.is_removed_file:
+            hunk_texts.append(_render_hunk(hunk))
         for line in hunk:
             # `unidiff` types both line numbers as Optional[int]: the target
             # number is None on removed lines and vice versa. Narrow rather
@@ -131,7 +140,11 @@ def _changed_file_from_patched_file(patched_file: PatchedFile) -> ChangedFile:
         is_removed=patched_file.is_removed_file,
         is_renamed=patched_file.is_rename,
         source_path=source_path,
-        hunks_text="".join(hunk_texts),
+        hunks_text=(
+            _REMOVED_FILE_PLACEHOLDER
+            if patched_file.is_removed_file
+            else "".join(hunk_texts)
+        ),
         added_line_numbers=added_line_numbers,
         removed_line_numbers=removed_line_numbers,
     )
