@@ -8,8 +8,9 @@ cause (token write-scope, fork PRs) than a failed *fetch*.
 """
 
 import logging
-from typing import cast
+from typing import Any, cast
 
+from githubkit import GitHub
 from githubkit.exception import RequestError, RequestFailed, RequestTimeout
 from githubkit_schemas.latest.types import (
     ReposOwnerRepoPullsPullNumberReviewsPostBodyType,
@@ -26,6 +27,12 @@ from pr_review_agent.models import ReviewOutput
 from pr_review_agent.output import build_review_payload
 
 logger = logging.getLogger(__name__)
+
+# GitHub's own restriction, not this tool's: the default Actions GITHUB_TOKEN
+# is structurally barred from approving a pull request, even with `pull-
+# requests: write`. It surfaces as a 422 rather than a 403, so it can't be
+# told apart from a genuinely malformed payload by status code alone.
+_APPROVAL_NOT_PERMITTED_MARKER = "not permitted to approve pull requests"
 
 
 class GitHubPublishError(RuntimeError):
@@ -83,6 +90,43 @@ def _raise_for_publish_error(exc: Exception, context: str) -> GitHubPublishError
     )
 
 
+def _is_approval_not_permitted(exc: Exception) -> bool:
+    """Detect GitHub's "Actions can't approve PRs" rejection specifically.
+
+    Args:
+        exc: The exception raised by `create_review`.
+
+    Returns:
+        bool: True if `exc` is the 422 GitHub returns for exactly this
+        restriction, not some other unprocessable-payload cause.
+    """
+    return (
+        isinstance(exc, RequestFailed)
+        and exc.response.status_code == 422
+        and _APPROVAL_NOT_PERMITTED_MARKER in exc.response.text
+    )
+
+
+def _post(
+    github: GitHub, owner: str, name: str, pr_number: int, payload: dict[str, Any]
+) -> None:
+    """Call `create_review` with an already-built payload.
+
+    Args:
+        github: The githubkit client.
+        owner: Repository owner.
+        name: Repository name.
+        pr_number: The pull request number to review.
+        payload: `{"event", "body", "comments"}`, per `build_review_payload`.
+    """
+    github.rest.pulls.create_review(
+        owner,
+        name,
+        pr_number,
+        data=cast(ReposOwnerRepoPullsPullNumberReviewsPostBodyType, payload),
+    )
+
+
 def post_review(
     pr_number: int, review_output: ReviewOutput, repo: str | None = None
 ) -> None:
@@ -94,6 +138,15 @@ def post_review(
     schema slot for it — and relies on `body` already containing the rendered
     criteria section built once in `output.build_summary`.
 
+    If the model's verdict was `APPROVE` and GitHub rejects the post because
+    the default Actions token is barred from approving pull requests, this
+    retries once as a `COMMENT` review instead of failing outright — the
+    inline findings and summary are the valuable part of the post, and losing
+    them entirely over a token restriction this tool can't do anything about
+    would be worse than posting without the formal approval state. The
+    verdict recorded in local artifacts (`review_output.event`) is untouched;
+    only the outgoing payload is downgraded.
+
     Args:
         pr_number: The pull request number to review.
         review_output: The review to post. Callers must never pass a review
@@ -104,7 +157,7 @@ def post_review(
 
     Raises:
         GitHubPublishError: If no token is available, the repository cannot
-            be resolved, or the API call fails.
+            be resolved, or the API call fails (including the retried post).
     """
     try:
         owner, name = resolve_repo(repo)
@@ -114,20 +167,29 @@ def post_review(
 
     context = f"PR #{pr_number} in {owner}/{name}"
     payload = build_review_payload(review_output)
+    posted_event = payload["event"]
 
     try:
-        github.rest.pulls.create_review(
-            owner,
-            name,
-            pr_number,
-            data=cast(ReposOwnerRepoPullsPullNumberReviewsPostBodyType, payload),
-        )
+        _post(github, owner, name, pr_number, payload)
     except (RequestFailed, RequestTimeout, RequestError) as exc:
-        raise _raise_for_publish_error(exc, context) from exc
+        if not _is_approval_not_permitted(exc):
+            raise _raise_for_publish_error(exc, context) from exc
+
+        logger.warning(
+            "GitHub Actions' default token cannot approve pull requests; "
+            "posting %s as a COMMENT review instead of APPROVE.",
+            context,
+        )
+        posted_event = "COMMENT"
+        retry_payload = {**payload, "event": posted_event}
+        try:
+            _post(github, owner, name, pr_number, retry_payload)
+        except (RequestFailed, RequestTimeout, RequestError) as retry_exc:
+            raise _raise_for_publish_error(retry_exc, context) from retry_exc
 
     logger.info(
         "Posted review to PR #%d: event=%s, %d inline comment(s)",
         pr_number,
-        review_output.event,
+        posted_event,
         len(review_output.comments),
     )
