@@ -1132,8 +1132,8 @@ keep it cheap.
 
 #### Manual
 
-- [ ] 5.1 Exercised via the Testing Strategy end-to-end run (no dedicated unit tests this iteration)
-- [ ] 5.2 `submit_review_verdict` produces a valid verdict on a real run; a mismatched-criteria call is rejected with a retryable error
+- [x] 5.1 Exercised via the Testing Strategy end-to-end run (no dedicated unit tests this iteration) — c504a8c
+- [x] 5.2 `submit_review_verdict` produces a valid verdict on a real run; a mismatched-criteria call is rejected with a retryable error — c504a8c
 
 ### Phase 6: output.py
 
