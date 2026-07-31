@@ -1,0 +1,56 @@
+name: Self-Test (Dogfood)
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dogfood:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Run AI PR review
+        uses: ./
+        with:
+          pr-number: ${{ github.event.pull_request.number }}
+          rules-file: AGENTS.md
+          criteria-file: context/foundation/review-criteria.md
+          anthropic-base-url: "https://openrouter.ai/api"
+          anthropic-auth-token: ${{ secrets.OPENROUTER_API_KEY }}
+          github-token: ${{ github.token }}
+          publish: "true"
+      - name: Upload review output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: review-output
+          path: review-output/
+
+  path-resolution-test:
+    runs-on: ubuntu-latest
+    steps:
+      # The "caller" checkout, at the workspace root.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # The action's own source, deliberately NOT at the workspace root.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: _action
+      # A criteria file that exists ONLY at the workspace root, never under
+      # _action/ — this is the discriminator between --project and --directory.
+      - shell: bash
+        run: |
+          mkdir -p _fixture
+          cp context/foundation/review-criteria.md _fixture/criteria.md
+      - uses: ./_action
+        with:
+          pr-number: ${{ github.event.pull_request.number }}
+          criteria-file: _fixture/criteria.md
+          rules-file: AGENTS.md
+          model: claude-haiku-4-5
+          anthropic-base-url: "https://openrouter.ai/api"
+          anthropic-auth-token: ${{ secrets.OPENROUTER_API_KEY }}
+          github-token: ${{ github.token }}
+          # publish deliberately omitted — dry run only

@@ -1284,5 +1284,5 @@ keep it cheap.
 
 #### Manual
 
-- [ ] 12.1 This repo's own discovery session completed, `review-criteria.md` and a minimal `AGENTS.md` committed
+- [x] 12.1 This repo's own discovery session completed, `review-criteria.md` and a minimal `AGENTS.md` committed
 - [ ] 12.2 Assignment-evidence smoke test per Testing Strategy step 4 (job visible in Actions tab, `--verbose` logs visible during the step, real inline comment visible on this repo's own PR)

@@ -1,0 +1,97 @@
+name: "AI PR Code Review"
+description: "Reviews a PR's diff against caller-supplied rules and review criteria, using Claude."
+inputs:
+  pr-number:
+    description: "Pull request number to review."
+    required: true
+  repo:
+    description: "OWNER/REPO to review. Defaults to GITHUB_REPOSITORY, then the local checkout's origin remote."
+    required: false
+  rules-file:
+    description: "Path to the repository rules file, injected into the prompt verbatim. Optional."
+    required: false
+    default: "AGENTS.md"
+  criteria-file:
+    description: "Path to a markdown file with at least one `##` review criterion. Required."
+    required: true
+  lessons-file:
+    description: "Optional path to an additional lessons/pitfalls file."
+    required: false
+  scope-dirs:
+    description: "Restrict the review to files under these directory prefixes (comma-separated). Omit to review every changed file."
+    required: false
+  exclude:
+    description: "Glob pattern(s) of paths to exclude from the review (comma-separated)."
+    required: false
+  model:
+    description: "Model to run the review with."
+    required: false
+    default: "claude-sonnet-5"
+  max-turns:
+    description: "Agent turn budget."
+    required: false
+    default: "5"
+  max-findings:
+    description: "Maximum number of findings to keep, after deduplication."
+    required: false
+    default: "30"
+  format:
+    description: "Which output form(s) to produce: console, json, markdown, or all."
+    required: false
+    default: "console"
+  publish:
+    description: "Post the review to GitHub as real inline PR comments."
+    required: false
+    default: "false"
+  trust-head-files:
+    description: "Read the rules/lessons/criteria files from the working checkout instead of the PR's base ref. Unsafe for pull requests you don't control."
+    required: false
+    default: "false"
+  out-dir:
+    description: "Directory to write review artifacts into."
+    required: false
+    default: "./review-output"
+  anthropic-api-key:
+    description: "Direct Anthropic API key. Set this, or the base-url/auth-token pair below for a gateway, not both."
+    required: false
+    default: ""
+  anthropic-base-url:
+    description: "Base URL for an Anthropic-API-compatible gateway (e.g. OpenRouter). Used together with anthropic-auth-token."
+    required: false
+    default: ""
+  anthropic-auth-token:
+    description: "Auth token for an Anthropic-API-compatible gateway. Used together with anthropic-base-url."
+    required: false
+    default: ""
+  github-token:
+    description: "GitHub token with pull-requests: write permission (for --publish) and read access to the repo being reviewed."
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+    - name: Install pr-review-agent
+      shell: bash
+      run: uv sync --project "${{ github.action_path }}"
+    - name: Run review
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        ANTHROPIC_BASE_URL: ${{ inputs.anthropic-base-url }}
+        ANTHROPIC_AUTH_TOKEN: ${{ inputs.anthropic-auth-token }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        uv run --project "${{ github.action_path }}" pr-review-agent \
+          --pr "${{ inputs.pr-number }}" \
+          ${{ inputs.repo != '' && format('--repo "{0}"', inputs.repo) || '' }} \
+          --rules-file "${{ inputs.rules-file }}" \
+          --criteria-file "${{ inputs.criteria-file }}" \
+          ${{ inputs.lessons-file != '' && format('--lessons-file "{0}"', inputs.lessons-file) || '' }} \
+          ${{ inputs.scope-dirs != '' && format('--scope-dirs "{0}"', inputs.scope-dirs) || '' }} \
+          ${{ inputs.exclude != '' && format('--exclude "{0}"', inputs.exclude) || '' }} \
+          --max-turns "${{ inputs.max-turns }}" \
+          --max-findings "${{ inputs.max-findings }}" \
+          --out-dir "${{ inputs.out-dir }}" \
+          --model "${{ inputs.model }}" --format "${{ inputs.format }}" \
+          ${{ inputs.publish == 'true' && '--publish' || '' }} \
+          ${{ inputs.trust-head-files == 'true' && '--trust-head-files' || '' }} --verbose
