@@ -503,6 +503,16 @@ dependency.
   there), so the model reads `line` directly instead of counting;
   `agents_context._SUBMIT_FINDING_CONTRACT` was updated to describe the
   annotation and tell the model to use it verbatim.
+- **Deleted-file placeholder** *(added 2026-07-31, commit `d16ca6a`; recorded
+  here 2026-08-01 during the phases 10-12 impl review, F9)*. A fully deleted
+  file has no new code left to review, so rendering its whole body only burns
+  the diff-context budget on content nothing can act on. `hunks_text` becomes
+  `"[file deleted, contents not shown — nothing to review]"` for
+  `is_removed_file`. The guard sits *outside* the per-line loop, so
+  `removed_line_numbers` is still populated and `ChangedFile`'s shape stays
+  uniform; `_file_header` still renders `(removed)`, and `build_diff_context`
+  accounting is unaffected because `_file_block` measures the now-shorter
+  `hunks_text`.
 
 **Test plan:** `tests/fixtures/sample.diff` covers 5 cases in one diff: a
 modified file (added+removed lines in one hunk), an added file, a renamed
@@ -538,9 +548,19 @@ Plain code, no agent. `GitHubApiError(RuntimeError)`; `PullRequestMetadata`
 dataclass (adds `state`/`merged` fields — *added during Phase 8 manual
 testing, user decision 2026-07-31*, so `cli.py` can skip a closed/merged PR
 before fetching its diff); `resolve_repo(repo=None) -> tuple[str, str]`;
-`get_pr_metadata(pr_number, repo=None)` via `pulls.get` + paginated
-`pulls.list_files`; `get_pr_diff(pr_number, repo=None)` via the raw-patch
-media type (see "GitHub transport" under Key Decisions).
+`get_pr_metadata(pr_number, repo=None)` via `pulls.get`; `get_pr_diff(pr_number,
+repo=None)` via the raw-patch media type (see "GitHub transport" under Key
+Decisions).
+
+*(Amended 2026-08-01, impl-review finding F10h.)* `get_pr_metadata` originally
+also paginated `pulls.list_files` into a `files: list[str]`. The only thing that
+list was ever used for was `if not pr_metadata.files` — a boolean that
+`pulls.get` already answers via `changed_files`, and which ran *after*
+`get_pr_diff` anyway, so a no-op PR paid for both. The field is now
+`changed_file_count: int` and the pagination (up to 30 extra API calls) is gone;
+the paths themselves always came from `diff_parser`. Relatedly (F10f),
+`build_client` is `@lru_cache(maxsize=1)`d — a run built six clients and six
+`truststore` SSL contexts, discarding the connection pool each time.
 
 **Repository resolution** replaces `gh`'s `-R/--repo`: explicit argument →
 `GITHUB_REPOSITORY` (always set by Actions) → the `origin` remote of the
@@ -635,6 +655,18 @@ Adds `claude-agent-sdk` dependency.
 - `findings: list[Finding]` collected via closure inside a
   `@tool("submit_finding", ...)` handler — validates `side`/`severity`,
   appends, returns a short confirmation.
+  - **Anchor validation** *(amended 2026-08-01, impl-review finding F4)*. The
+    handler also rejects a finding whose `(path, line, side)` is not an anchor
+    that actually exists in the diff, returning `is_error: True` naming the
+    valid lines so the model can retry. `ChangedFile.added_line_numbers` /
+    `removed_line_numbers` were being computed for every file and consumed by
+    nothing; they are exactly this data. Without the check, one hallucinated
+    line number reaches GitHub, which rejects the **entire** `create_review`
+    call with a 422 — discarding the summary and every valid inline comment for
+    a run that already completed and was already paid for. The line-annotated
+    `hunks_text` (Phase 2) makes that miscount less likely; this makes it
+    non-fatal. `run_review` therefore takes `changed_files: list[ChangedFile]`,
+    threaded from `cli.py`'s in-scope list through `_build_options`.
 - `verdict: ReviewVerdict | None` (starts `None`) collected via closure
   inside a second `@tool("submit_review_verdict", ...)` handler — validates
   the submitted criteria names are an exact set-match against the loaded
@@ -651,6 +683,24 @@ Adds `claude-agent-sdk` dependency.
   *consumer's* checkout root (see Phase 10's critical `--project` vs
   `--directory` note), never this action's own source location. Never
   `bypassPermissions` (it ignores `allowed_tools`).
+  - **`disallowed_tools` completed** *(amended 2026-08-01, impl-review finding
+    F7)*. The draft list above missed `WebFetch` — the one egress tool that
+    could send a file's contents to an attacker-chosen URL, and the one the
+    PreToolUse path guard cannot see (its matcher is `Read|Grep|Glob`). Since
+    every other mutation/egress tool is covered twice (absent from
+    `allowed_tools` *and* named here), `WebFetch` was the single control
+    resting on SDK default behavior alone. The list is now `Bash`, `BashOutput`,
+    `KillShell`, `Write`, `Edit`, `NotebookEdit`, `WebFetch`, `WebSearch`,
+    `SlashCommand`, `Task`.
+  - **Glob's `pattern` is a path** *(amended 2026-08-01, impl-review finding
+    F5)*. The PreToolUse guard originally checked only `file_path` and `path`,
+    on the reasoning that everything else those tools accept is matched against
+    contents or names. True for Grep, false for Glob, whose `pattern` *is* the
+    path selector and whose `path` is optional — so `Glob(pattern=
+    "/home/runner/**/*")` never touched the guard at all. The guard now anchors
+    the pattern's literal (wildcard-free) prefix against `path` or `repo_root`
+    and applies the same containment test, denying a rooted pattern that has no
+    prefix left to anchor. Grep's `pattern` stays exempt.
 - **Repo-mismatch guard.** `cwd` is the local checkout, but the diff comes
   from whatever `--repo` names. In the supported consumption path these are
   the same thing — the caller runs `actions/checkout` on its own repo and
@@ -681,9 +731,19 @@ Adds `claude-agent-sdk` dependency.
   (overloaded API, `error_max_turns`). Success with `verdict` still `None`
   — never called, or every attempt failed validation → exit `5`, which a
   consumer reads as advisory.
-- No unit tests for this module this iteration (depends on a live SDK/API
+- ~~No unit tests for this module this iteration (depends on a live SDK/API
   connection) — verification deferred to the end-to-end runs in "Testing
-  Strategy / Verification."
+  Strategy / Verification."~~ *(Superseded 2026-08-01, impl-review finding
+  F8.)* The live-connection rationale only ever covered `run_review`'s
+  `query()` loop. `_build_options`, `_make_repo_path_guard` and the two tool
+  handlers are pure functions, and they are where this module's security
+  controls live — `setting_sources=[]` in particular is a kwarg that reads
+  like a default, so an SDK version bump could plausibly drop it and re-open
+  full `.claude/settings.json` + `CLAUDE.md` + `.mcp.json` loading from the
+  attacker-controlled head checkout with every test still green.
+  `tests/test_review_agent.py` now pins the options, the path guard, the
+  disallowed-tools list and the anchor validation; `tests/test_github_publish.py`
+  pins the APPROVE→COMMENT 422 downgrade.
 
 ## Phase 6: output.py
 
@@ -780,7 +840,15 @@ plain prefix match put `api_client_generated/bundle.min.js` in scope for
 `--scope-dirs api`, and one generated file can consume the whole
 diff-context budget.*)
 
-`main_async` orchestration, exit-code contract:
+`main_async` orchestration, exit-code contract. *(Amended 2026-08-01,
+impl-review findings F10a/F10b: the status messages in steps 2, 4 and 11 below
+are `logger.info` on **stderr**, not `print`. `AGENTS.md` reserves stdout for
+review output, and under `--format json` these were the only thing on it,
+corrupting a consumer's parse. Step 12's console rendering also now runs on the
+`--publish` path when `--format` is `console`/`all` — publishing used to return
+before reaching it, so `--publish --format all` silently produced no console
+output at all. `print_console` takes a `published` flag so the banner reads
+"PUBLISHED TO GITHUB" instead of claiming a dry run that didn't happen.)*
 
 1. Fetch PR metadata; `GitHubApiError` → stderr message, exit `2`.
 2. **Closed/merged-PR guard** *(added during Phase 8 manual testing, user
@@ -916,7 +984,9 @@ runs:
     - uses: astral-sh/setup-uv@<pinned-sha>
     - name: Install pr-review-agent
       shell: bash
-      run: uv sync --project "${{ github.action_path }}"
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: uv sync --project "$ACTION_PATH"
     - name: Run review
       shell: bash
       env:
@@ -924,27 +994,48 @@ runs:
         ANTHROPIC_BASE_URL: ${{ inputs.anthropic-base-url }}
         ANTHROPIC_AUTH_TOKEN: ${{ inputs.anthropic-auth-token }}
         GH_TOKEN: ${{ inputs.github-token }}
+        ACTION_PATH: ${{ github.action_path }}
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+        # …one INPUT_* per declared input; see action.yml for the full block.
       run: |
-        uv run --project "${{ github.action_path }}" pr-review-agent \
-          --pr "${{ inputs.pr-number }}" \
-          ${{ inputs.repo != '' && format('--repo "{0}"', inputs.repo) || '' }} \
-          --rules-file "${{ inputs.rules-file }}" \
-          --criteria-file "${{ inputs.criteria-file }}" \
-          ${{ inputs.lessons-file != '' && format('--lessons-file "{0}"', inputs.lessons-file) || '' }} \
-          ${{ inputs.scope-dirs != '' && format('--scope-dirs "{0}"', inputs.scope-dirs) || '' }} \
-          ${{ inputs.exclude != '' && format('--exclude "{0}"', inputs.exclude) || '' }} \
-          --max-turns "${{ inputs.max-turns }}" \
-          --max-findings "${{ inputs.max-findings }}" \
-          --out-dir "${{ inputs.out-dir }}" \
-          --model "${{ inputs.model }}" --format "${{ inputs.format }}" \
-          ${{ inputs.publish == 'true' && '--publish' || '' }} \
-          ${{ inputs.trust-head-files == 'true' && '--trust-head-files' || '' }} --verbose
+        set -euo pipefail
+        args=(
+          --pr "$INPUT_PR_NUMBER"
+          --rules-file "$INPUT_RULES_FILE"
+          --criteria-file "$INPUT_CRITERIA_FILE"
+          --max-turns "$INPUT_MAX_TURNS"
+          --max-findings "$INPUT_MAX_FINDINGS"
+          --out-dir "$INPUT_OUT_DIR"
+          --model "$INPUT_MODEL"
+          --format "$INPUT_FORMAT"
+          --verbose
+        )
+        if [ -n "$INPUT_REPO" ]; then args+=(--repo "$INPUT_REPO"); fi
+        if [ -n "$INPUT_LESSONS_FILE" ]; then args+=(--lessons-file "$INPUT_LESSONS_FILE"); fi
+        if [ -n "$INPUT_SCOPE_DIRS" ]; then args+=(--scope-dirs "$INPUT_SCOPE_DIRS"); fi
+        if [ -n "$INPUT_EXCLUDE" ]; then args+=(--exclude "$INPUT_EXCLUDE"); fi
+        if [ "$INPUT_PUBLISH" = "true" ]; then args+=(--publish); fi
+        if [ "$INPUT_TRUST_HEAD_FILES" = "true" ]; then args+=(--trust-head-files); fi
+        uv run --project "$ACTION_PATH" pr-review-agent "${args[@]}"
 ```
+
+**Amended 2026-08-01 during the phases 10-12 impl review (F3).** The original
+draft interpolated every input directly into the `run:` body as
+`--model "${{ inputs.model }}"`, with the optional ones using an
+empty-string-fallback `format()` expression. That shape is a script-injection
+hole: `${{ }}` is substituted *textually* before bash parses the line, so the
+surrounding quotes protect nothing. A consumer wiring the action to a
+`/review` comment (`scope-dirs: ${{ github.event.comment.body }}`) would hand
+the commenter a shell on the runner, with `GH_TOKEN` and the Anthropic token
+already exported into that step. Inputs now reach the script only through
+`env:`, and the conditional flags are assembled by bash into an array instead
+of by expression concatenation. `if` blocks rather than `[ … ] && args+=(…)`,
+since under `set -e` a false test would abort the step.
 
 **Every declared input is forwarded.** The three with defaults
 (`max-turns`, `max-findings`, `out-dir`) go unconditionally; the four
 genuinely optional ones (`repo`, `lessons-file`, `scope-dirs`, `exclude`)
-use the empty-string-fallback expression form. Getting this wrong is not a
+are appended only when non-empty. Getting this wrong is not a
 cosmetic bug: `scope-dirs` is the headline generalization of this whole
 plan, and a consumer that sets it while the run step drops it would get
 every changed file reviewed with no error — and a consumer overriding
@@ -1288,6 +1379,7 @@ checkout here is correct, not a workaround.
 - [x] 8.2 Exit-code contract smoke test per Testing Strategy step 9 — 55246f3
 - [x] 8.3 `--publish` and post-failure smoke tests per Testing Strategy steps 7-8 — 55246f3
 - [x] 8.4 Closed/merged-PR guard confirmed live per Testing Strategy step 8b (exit `0`, no diff fetch, no agent run, no publish attempt) — 55246f3
+- [x] 8.5 `README.md` covers setup, the criteria-file prerequisite, a usage example, the `--publish` warning, the fork-PR limitation, "no default `scope-dirs`/`exclude`", and the Anthropic auth choice including the both-set warning (Risk #11's only mitigation). Added 2026-08-01 during the phases 10-12 impl review (F2) — the original Phase 8 Progress block had no checkbox for the README, so nothing gated it.
 
 ### Phase 9: final pyproject.toml
 

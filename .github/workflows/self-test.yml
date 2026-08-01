@@ -7,9 +7,22 @@ permissions:
   contents: read
   pull-requests: write
 
+# SECURITY — both jobs below run the action *from the pull request's own head*
+# (`uses: ./` and `uses: ./_action`) while `OPENROUTER_API_KEY` is in scope.
+# That is the entire point of a dogfood job, but it does mean a PR that edits
+# this action's source can read the key. The exposure is bounded to people with
+# push access, because a `pull_request` event from a fork gets no secrets at all
+# — which is also why the jobs are skipped outright for forks rather than left
+# to fail confusingly on a missing key.
+#
+# The durable fix is a repository *environment* holding OPENROUTER_API_KEY with
+# required reviewers, so a maintainer has to approve each run before the secret
+# is released. That needs a repo-settings change; add `environment: dogfood` to
+# both jobs once it exists.
 jobs:
   dogfood:
     runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Run AI PR review
@@ -31,6 +44,7 @@ jobs:
 
   path-resolution-test:
     runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       # The "caller" checkout, at the workspace root.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

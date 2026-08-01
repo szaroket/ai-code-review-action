@@ -72,7 +72,15 @@ runs:
     - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
     - name: Install pr-review-agent
       shell: bash
-      run: uv sync --project "${{ github.action_path }}"
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: uv sync --project "$ACTION_PATH"
+    # Every input reaches the script through `env:`, never through `${{ }}`
+    # inside `run:`. Expressions are substituted textually before bash parses
+    # the line, so quoting an interpolation gives no protection at all — a
+    # consumer passing e.g. `scope-dirs: ${{ github.event.comment.body }}`
+    # would otherwise hand a PR commenter a shell on the runner, with GH_TOKEN
+    # and the Anthropic token already exported into this very step.
     - name: Run review
       shell: bash
       env:
@@ -80,18 +88,40 @@ runs:
         ANTHROPIC_BASE_URL: ${{ inputs.anthropic-base-url }}
         ANTHROPIC_AUTH_TOKEN: ${{ inputs.anthropic-auth-token }}
         GH_TOKEN: ${{ inputs.github-token }}
+        ACTION_PATH: ${{ github.action_path }}
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+        INPUT_REPO: ${{ inputs.repo }}
+        INPUT_RULES_FILE: ${{ inputs.rules-file }}
+        INPUT_CRITERIA_FILE: ${{ inputs.criteria-file }}
+        INPUT_LESSONS_FILE: ${{ inputs.lessons-file }}
+        INPUT_SCOPE_DIRS: ${{ inputs.scope-dirs }}
+        INPUT_EXCLUDE: ${{ inputs.exclude }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_MAX_TURNS: ${{ inputs.max-turns }}
+        INPUT_MAX_FINDINGS: ${{ inputs.max-findings }}
+        INPUT_FORMAT: ${{ inputs.format }}
+        INPUT_OUT_DIR: ${{ inputs.out-dir }}
+        INPUT_PUBLISH: ${{ inputs.publish }}
+        INPUT_TRUST_HEAD_FILES: ${{ inputs.trust-head-files }}
       run: |
-        uv run --project "${{ github.action_path }}" pr-review-agent \
-          --pr "${{ inputs.pr-number }}" \
-          ${{ inputs.repo != '' && format('--repo "{0}"', inputs.repo) || '' }} \
-          --rules-file "${{ inputs.rules-file }}" \
-          --criteria-file "${{ inputs.criteria-file }}" \
-          ${{ inputs.lessons-file != '' && format('--lessons-file "{0}"', inputs.lessons-file) || '' }} \
-          ${{ inputs.scope-dirs != '' && format('--scope-dirs "{0}"', inputs.scope-dirs) || '' }} \
-          ${{ inputs.exclude != '' && format('--exclude "{0}"', inputs.exclude) || '' }} \
-          --max-turns "${{ inputs.max-turns }}" \
-          --max-findings "${{ inputs.max-findings }}" \
-          --out-dir "${{ inputs.out-dir }}" \
-          --model "${{ inputs.model }}" --format "${{ inputs.format }}" \
-          ${{ inputs.publish == 'true' && '--publish' || '' }} \
-          ${{ inputs.trust-head-files == 'true' && '--trust-head-files' || '' }} --verbose
+        set -euo pipefail
+        args=(
+          --pr "$INPUT_PR_NUMBER"
+          --rules-file "$INPUT_RULES_FILE"
+          --criteria-file "$INPUT_CRITERIA_FILE"
+          --max-turns "$INPUT_MAX_TURNS"
+          --max-findings "$INPUT_MAX_FINDINGS"
+          --out-dir "$INPUT_OUT_DIR"
+          --model "$INPUT_MODEL"
+          --format "$INPUT_FORMAT"
+          --verbose
+        )
+        # `if` rather than `[ ... ] && args+=(...)`: under `set -e` a failing
+        # test would make the whole compound non-zero and abort the step.
+        if [ -n "$INPUT_REPO" ]; then args+=(--repo "$INPUT_REPO"); fi
+        if [ -n "$INPUT_LESSONS_FILE" ]; then args+=(--lessons-file "$INPUT_LESSONS_FILE"); fi
+        if [ -n "$INPUT_SCOPE_DIRS" ]; then args+=(--scope-dirs "$INPUT_SCOPE_DIRS"); fi
+        if [ -n "$INPUT_EXCLUDE" ]; then args+=(--exclude "$INPUT_EXCLUDE"); fi
+        if [ "$INPUT_PUBLISH" = "true" ]; then args+=(--publish); fi
+        if [ "$INPUT_TRUST_HEAD_FILES" = "true" ]; then args+=(--trust-head-files); fi
+        uv run --project "$ACTION_PATH" pr-review-agent "${args[@]}"

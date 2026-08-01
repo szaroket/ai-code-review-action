@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_FINDINGS = 30
 
 _DRY_RUN_BANNER = "=== DRY RUN — NOT PUBLISHED TO GITHUB ==="
+_PUBLISHED_BANNER = "=== PUBLISHED TO GITHUB ==="
 _INCOMPLETE_BANNER = "=== INCOMPLETE — NO VERDICT PRODUCED ==="
 
 _CRITERION_ICONS = {
@@ -318,14 +319,19 @@ def _group_by_file(findings: list[Finding]) -> list[tuple[str, list[Finding]]]:
     return list(grouped.items())
 
 
-def print_console(review_output: ReviewOutput, was_capped: bool) -> None:
-    """Print the dry-run console preview of a review to stdout.
+def print_console(
+    review_output: ReviewOutput, was_capped: bool, *, published: bool = False
+) -> None:
+    """Print the console rendering of a review to stdout.
 
     Args:
         review_output: The review to render.
         was_capped: Whether `comments` was truncated to fit the findings cap.
+        published: Whether the review was actually posted to GitHub. Only the
+            banner differs — claiming "DRY RUN" after a real post would be a
+            lie, but the findings are worth printing either way.
     """
-    print(_DRY_RUN_BANNER)
+    print(_PUBLISHED_BANNER if published else _DRY_RUN_BANNER)
     print()
     print(review_output.summary_body)
     if was_capped:

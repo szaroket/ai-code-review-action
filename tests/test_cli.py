@@ -127,16 +127,14 @@ def test_parse_comma_list_drops_empty_entries() -> None:
 # swaps only the boundary it is about and leaves the real pipeline running.
 
 
-def _metadata(
-    state: str = "open", files: list[str] | None = None
-) -> PullRequestMetadata:
+def _metadata(state: str = "open", changed_file_count: int = 1) -> PullRequestMetadata:
     return PullRequestMetadata(
         number=42,
         title="Add a handler",
         url="https://github.com/owner/name/pull/42",
         base_ref_name="main",
         head_ref_name="feature",
-        files=["api/handler.py"] if files is None else files,
+        changed_file_count=changed_file_count,
         state=state,
         merged=False,
     )
@@ -237,7 +235,9 @@ def test_closed_pr_is_skipped_without_running_the_agent(
 def test_pr_with_no_changed_files_exits_zero(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(cli, "get_pr_metadata", lambda pr, repo: _metadata(files=[]))
+    monkeypatch.setattr(
+        cli, "get_pr_metadata", lambda pr, repo: _metadata(changed_file_count=0)
+    )
     assert _run_cli(tmp_path) == EXIT_SUCCESS
 
 
@@ -404,6 +404,44 @@ def test_review_inputs_come_from_the_base_ref_not_the_checkout(
 
 
 @pytest.mark.usefixtures("happy_path")
+def test_in_repo_symlink_escaping_the_checkout_is_refused(tmp_path: Path) -> None:
+    """A head-authored symlink must not promote its target to a trusted disk read."""
+    secret = tmp_path.parent / "outside-the-checkout.txt"
+    secret.write_text("ANTHROPIC_AUTH_TOKEN=leaked", encoding="utf-8")
+    rules = tmp_path / "AGENTS.md"
+    try:
+        rules.symlink_to(secret)
+    except OSError:  # pragma: no cover - Windows without symlink privileges
+        pytest.skip("this platform does not allow creating symlinks")
+
+    assert _run_cli(tmp_path, "--rules-file", str(rules)) == EXIT_INPUT_FILE_ERROR
+
+
+@pytest.mark.usefixtures("happy_path")
+def test_in_repo_symlink_staying_inside_still_uses_the_base_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The escape guard must not reject symlinks that never leave the checkout."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "rules.md").write_text("be strict", encoding="utf-8")
+    rules = tmp_path / "AGENTS.md"
+    try:
+        rules.symlink_to(tmp_path / "docs" / "rules.md")
+    except OSError:  # pragma: no cover - Windows without symlink privileges
+        pytest.skip("this platform does not allow creating symlinks")
+
+    seen: list[tuple[str, str]] = []
+
+    def _record(path: str, ref: str, repo: str) -> str:
+        seen.append((path, ref))
+        return _CRITERIA.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(cli, "get_file_at_ref", _record)
+    assert _run_cli(tmp_path, "--rules-file", str(rules)) == EXIT_SUCCESS
+    assert ("AGENTS.md", "main") in seen
+
+
+@pytest.mark.usefixtures("happy_path")
 def test_trust_head_files_reads_the_checkout_instead(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -423,3 +461,27 @@ def test_base_ref_fetch_failure_exits_two(
 
     monkeypatch.setattr(cli, "get_file_at_ref", _boom)
     assert _run_cli(tmp_path) == EXIT_GITHUB_FETCH_ERROR
+
+
+@pytest.mark.usefixtures("happy_path")
+def test_publish_with_format_all_still_prints_the_console_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Publishing used to return before the console branch was ever reached."""
+    monkeypatch.setattr(cli, "post_review", lambda pr, review_output, repo: None)
+    assert _run_cli(tmp_path, "--publish", "--format", "all") == EXIT_SUCCESS
+
+    stdout = capsys.readouterr().out
+    assert "PUBLISHED TO GITHUB" in stdout
+    assert "DRY RUN" not in stdout
+    assert "api/handler.py" in stdout
+
+
+@pytest.mark.usefixtures("happy_path")
+def test_json_format_keeps_status_messages_off_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AGENTS.md reserves stdout for review output; status belongs on stderr."""
+    monkeypatch.setattr(cli, "get_pr_metadata", lambda pr, repo: _metadata("closed"))
+    assert _run_cli(tmp_path, "--format", "json") == EXIT_SUCCESS
+    assert capsys.readouterr().out == ""

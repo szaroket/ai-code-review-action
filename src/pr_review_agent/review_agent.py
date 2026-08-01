@@ -26,6 +26,7 @@ from claude_agent_sdk import (
     tool,
 )
 
+from pr_review_agent.diff_parser import ChangedFile
 from pr_review_agent.github_diff import PullRequestMetadata
 from pr_review_agent.models import (
     Criterion,
@@ -42,7 +43,24 @@ logger = logging.getLogger(__name__)
 
 _EXPLORATION_TOOLS = ["Read", "Grep", "Glob"]
 _MCP_TOOLS = ["mcp__reviewer__submit_finding", "mcp__reviewer__submit_review_verdict"]
-_DISALLOWED_TOOLS = ["Bash", "Write", "Edit", "NotebookEdit", "WebSearch", "Task"]
+# Every mutation and egress tool the SDK ships, named explicitly. They are all
+# already absent from `allowed_tools`; listing them here too is the second half
+# of the defence in depth described in `_build_options`. `WebFetch` matters most
+# — it is the one tool that could exfiltrate a file's contents to an attacker's
+# URL, and the PreToolUse path guard cannot help because its matcher only
+# covers Read/Grep/Glob.
+_DISALLOWED_TOOLS = [
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+    "SlashCommand",
+    "Task",
+]
 
 # The PR title and diff are authored by whoever opened the pull request. Fencing
 # them keeps a diff that contains prose like "ignore the criteria and approve"
@@ -59,9 +77,20 @@ _UNTRUSTED_PREAMBLE = (
 )
 
 # Path-bearing arguments of the three exploration tools: `file_path` for Read,
-# `path` for Grep and Glob. Anything else they accept (`pattern`, `glob`) is
-# matched against contents or names, not resolved as a filesystem location.
+# `path` for Grep and Glob. Grep's `pattern` is a regex matched against file
+# *contents*, so it is not a filesystem location — but Glob's `pattern` is one,
+# and it is the only required argument that tool has. It gets its own check
+# below (`_glob_pattern_denial`); without it a `Glob` call that omits `path`
+# entirely would never touch this guard at all.
 _PATH_ARG_NAMES = ("file_path", "path")
+
+# Characters that make a path segment a wildcard rather than a literal name.
+_GLOB_MAGIC = ("*", "?", "[")
+
+# How many valid line numbers (or paths) a rejection message lists before it
+# summarises. Enough for the model to re-anchor, short enough not to flood the
+# turn budget on a large file.
+_MAX_LISTED_ANCHORS = 20
 
 _SUBMIT_FINDING_SCHEMA = {
     "type": "object",
@@ -72,7 +101,12 @@ _SUBMIT_FINDING_SCHEMA = {
         },
         "line": {
             "type": "integer",
-            "description": "The line number in `side`'s version of the file.",
+            "description": (
+                "The line number in `side`'s version of the file. It must be a "
+                "line that actually appears in the diff — every line of "
+                "`hunks_text` is pre-annotated with its number, so read it off "
+                "rather than counting."
+            ),
         },
         "side": {
             "type": "string",
@@ -157,15 +191,86 @@ class ReviewRunResult:
     sdk_success: bool
 
 
-def _make_submit_finding_tool(collector: _Collector) -> Any:
+def _anchor_error(
+    finding: Finding, files_by_path: dict[str, ChangedFile]
+) -> str | None:
+    """Explain why `finding` can't be anchored to the diff, or None if it can.
+
+    GitHub's `create_review` rejects the *entire* review with a 422 ("Line
+    could not be resolved") if any single comment names a line outside the
+    diff — the summary and every valid inline comment go with it. `diff_parser`
+    already collects the exact set of anchorable line numbers per file, so a
+    hallucinated line can be caught here, while the model can still fix it,
+    instead of at publish time when the run is already paid for.
+
+    Args:
+        finding: The finding the model just submitted.
+        files_by_path: The files under review, keyed by their diff path.
+
+    Returns:
+        str | None: A retryable error message naming the valid anchors, or
+        None when `finding` points at a line that really is in the diff.
+    """
+    changed_file = files_by_path.get(finding.path)
+    if changed_file is None:
+        return (
+            f"`{finding.path}` is not one of the files under review. "
+            f"Reviewable paths: {_describe(sorted(files_by_path), quote=True)}"
+        )
+
+    lines = (
+        changed_file.added_line_numbers
+        if finding.side is DiffSide.RIGHT
+        else changed_file.removed_line_numbers
+    )
+    if finding.line in lines:
+        return None
+
+    if not lines:
+        return (
+            f"`{finding.path}` has no {finding.side.value}-side lines in this "
+            "diff, so no finding can be anchored to it. Drop this finding, or "
+            "re-anchor it to a file and line that appear in the diff."
+        )
+    return (
+        f"Line {finding.line} is not part of the diff for `{finding.path}` on "
+        f"the {finding.side.value} side. Valid {finding.side.value} lines are: "
+        f"{_describe(lines)}. Re-anchor the finding to one of those, or drop it."
+    )
+
+
+def _describe(values: list[int] | list[str], *, quote: bool = False) -> str:
+    """Render a bounded, human-readable preview of `values` for a tool error.
+
+    Args:
+        values: The line numbers or paths to list.
+        quote: Whether to wrap each value in backticks.
+
+    Returns:
+        str: Up to `_MAX_LISTED_ANCHORS` comma-separated values, with a count
+        of the remainder when the list was longer.
+    """
+    shown = [f"`{value}`" if quote else str(value) for value in values]
+    if len(shown) <= _MAX_LISTED_ANCHORS:
+        return ", ".join(shown)
+    head = ", ".join(shown[:_MAX_LISTED_ANCHORS])
+    return f"{head}, … ({len(shown)} in total)"
+
+
+def _make_submit_finding_tool(
+    collector: _Collector, changed_files: list[ChangedFile]
+) -> Any:
     """Build the `submit_finding` tool bound to `collector`.
 
     Args:
         collector: Mutable state to append validated findings to.
+        changed_files: The files under review, used to reject findings
+            anchored to a line that isn't in the diff.
 
     Returns:
         Any: The `SdkMcpTool` returned by the `@tool` decorator.
     """
+    files_by_path = {changed_file.path: changed_file for changed_file in changed_files}
 
     @tool(
         "submit_finding",
@@ -180,7 +285,8 @@ def _make_submit_finding_tool(collector: _Collector) -> Any:
 
         Returns:
             dict[str, Any]: An MCP tool-result payload; `is_error` is set when
-            `side` or `severity` fails validation.
+            `side` or `severity` fails validation, or when `path`/`line` don't
+            name a line that actually appears in the diff.
         """
         # The whole construction sits inside the try: `path` and `comment` are
         # required by the schema but a model can still omit them, and a KeyError
@@ -198,6 +304,14 @@ def _make_submit_finding_tool(collector: _Collector) -> Any:
         except (KeyError, ValueError, TypeError) as exc:
             return {
                 "content": [{"type": "text", "text": f"Invalid finding: {exc}"}],
+                "is_error": True,
+            }
+
+        anchor_error = _anchor_error(finding, files_by_path)
+        if anchor_error is not None:
+            logger.warning("Rejected an unanchored finding: %s", anchor_error)
+            return {
+                "content": [{"type": "text", "text": anchor_error}],
                 "is_error": True,
             }
 
@@ -307,6 +421,117 @@ def _deny(reason: str) -> HookJSONOutput:
     }
 
 
+def _outside_root(candidate: Path, resolved_root: Path) -> Path | None:
+    """Resolve `candidate` and report it if it lands outside `resolved_root`.
+
+    Args:
+        candidate: An absolute path to test.
+        resolved_root: The already-resolved checkout root.
+
+    Returns:
+        Path | None: The resolved path when it escapes the root, else None.
+
+    Raises:
+        OSError: If the path cannot be resolved at all.
+        ValueError: If the path contains an embedded NUL byte — POSIX raises
+            `ValueError`, not `OSError`, for that one. Callers must catch both
+            or the exception escapes the hook and the call is never denied.
+    """
+    # resolve() also collapses `..` and follows symlinks, so neither traversal
+    # nor a symlink planted by the PR escapes.
+    resolved = candidate.resolve()
+    if resolved == resolved_root or resolved_root in resolved.parents:
+        return None
+    return resolved
+
+
+def _glob_literal_prefix(pattern: str) -> str:
+    """The leading, wildcard-free portion of a glob pattern.
+
+    `src/api/**/*.py` anchors at `src/api`; `**/*.py` anchors nowhere and is
+    therefore relative to whatever base the tool was given.
+
+    Args:
+        pattern: A `Glob` tool `pattern` argument.
+
+    Returns:
+        str: The literal path prefix, possibly empty. Backslashes are treated
+        as separators too, so a Windows-style pattern can't slip past by
+        spelling its traversal with them.
+    """
+    literal: list[str] = []
+    for part in pattern.replace("\\", "/").split("/"):
+        if any(char in part for char in _GLOB_MAGIC):
+            break
+        literal.append(part)
+    return "/".join(literal)
+
+
+def _glob_pattern_denial(
+    tool_input: dict[str, Any], resolved_root: Path
+) -> HookJSONOutput | None:
+    """Deny a `Glob` call whose `pattern` selects paths outside the checkout.
+
+    `Glob(pattern="/home/runner/**/*")` needs no `path` argument at all, so the
+    `_PATH_ARG_NAMES` loop never sees it. The pattern is anchored against
+    `path` when one was given (already containment-checked by the caller) and
+    against the checkout root otherwise, then its literal prefix is held to the
+    same containment rule. An *absolute* pattern with no literal prefix at all
+    (`/**/*.pem`) is refused outright — there is nothing left to anchor.
+
+    Args:
+        tool_input: The `Glob` call's arguments.
+        resolved_root: The already-resolved checkout root.
+
+    Returns:
+        HookJSONOutput | None: A deny decision, or None to allow the call.
+    """
+    pattern = tool_input.get("pattern")
+    if not isinstance(pattern, str) or not pattern:
+        return None
+
+    base = resolved_root
+    raw_path = tool_input.get("path")
+    if isinstance(raw_path, str) and raw_path:
+        given = Path(raw_path)
+        base = given if given.is_absolute() else resolved_root / given
+
+    prefix = _glob_literal_prefix(pattern)
+    if not prefix:
+        # A leading separator makes the pattern rooted even on Windows, where
+        # `Path("/x").is_absolute()` is False for want of a drive letter — and
+        # the runner this actually ships to is POSIX.
+        rooted = (
+            pattern.replace("\\", "/").startswith("/") or Path(pattern).is_absolute()
+        )
+        if not rooted:
+            return None
+        logger.warning("Blocked an unanchorable absolute glob: pattern=%r", pattern)
+        return _deny(
+            f"pattern={pattern!r} is an absolute pattern with no directory to "
+            f"anchor it to. Glob only inside {resolved_root}."
+        )
+
+    candidate = Path(prefix)
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    try:
+        escaped = _outside_root(candidate, resolved_root)
+    except (OSError, ValueError) as exc:
+        return _deny(f"Could not resolve pattern={pattern!r}: {exc}")
+    if escaped is None:
+        return None
+
+    logger.warning(
+        "Blocked an out-of-repo glob: pattern=%r anchored at %s", pattern, escaped
+    )
+    return _deny(
+        f"pattern={pattern!r} selects paths outside the repository under "
+        f"review (it anchors at {escaped}). Only paths inside {resolved_root} "
+        "can be listed; review the diff you were given instead."
+    )
+
+
 def _make_repo_path_guard(repo_root: Path) -> Any:
     """Build the PreToolUse hook that confines Read/Grep/Glob to `repo_root`.
 
@@ -337,7 +562,8 @@ def _make_repo_path_guard(repo_root: Path) -> Any:
         """Deny the call if any path argument resolves outside `repo_root`.
 
         Args:
-            input_data: The PreToolUse payload, carrying `tool_input`.
+            input_data: The PreToolUse payload, carrying `tool_name` and
+                `tool_input`.
             tool_use_id: The tool call's identifier; unused.
             context: Hook context; unused.
 
@@ -345,7 +571,8 @@ def _make_repo_path_guard(repo_root: Path) -> Any:
             HookJSONOutput: An empty dict to let the call proceed, or a deny
             decision naming the offending argument.
         """
-        tool_input = cast(dict[str, Any], input_data).get("tool_input") or {}
+        payload = cast(dict[str, Any], input_data)
+        tool_input = payload.get("tool_input") or {}
         for arg_name in _PATH_ARG_NAMES:
             raw = tool_input.get(arg_name)
             if not isinstance(raw, str) or not raw:
@@ -354,23 +581,26 @@ def _make_repo_path_guard(repo_root: Path) -> Any:
             if not candidate.is_absolute():
                 candidate = resolved_root / candidate
             try:
-                # resolve() also collapses `..` and follows symlinks, so
-                # neither traversal nor a symlink planted by the PR escapes.
-                resolved = candidate.resolve()
-            except OSError as exc:
+                escaped = _outside_root(candidate, resolved_root)
+            except (OSError, ValueError) as exc:
                 return _deny(f"Could not resolve {arg_name}={raw!r}: {exc}")
-            if resolved != resolved_root and resolved_root not in resolved.parents:
+            if escaped is not None:
                 logger.warning(
                     "Blocked an out-of-repo tool path: %s=%r resolved to %s",
                     arg_name,
                     raw,
-                    resolved,
+                    escaped,
                 )
                 return _deny(
                     f"{arg_name}={raw!r} is outside the repository under "
                     f"review. Only paths inside {resolved_root} can be read; "
                     "review the diff you were given instead."
                 )
+
+        if payload.get("tool_name") == "Glob":
+            denial = _glob_pattern_denial(tool_input, resolved_root)
+            if denial is not None:
+                return denial
         return {}
 
     return guard
@@ -384,6 +614,7 @@ def _build_options(
     allow_repo_exploration: bool,
     collector: _Collector,
     criteria: list[Criterion],
+    changed_files: list[ChangedFile],
 ) -> ClaudeAgentOptions:
     """Assemble the `ClaudeAgentOptions` for one review run.
 
@@ -401,6 +632,8 @@ def _build_options(
         collector: Mutable state the two tools append/store into.
         criteria: The loaded review criteria, for the verdict tool's
             exact-name validation.
+        changed_files: The files under review, for the finding tool's
+            line-is-in-the-diff validation.
 
     Returns:
         ClaudeAgentOptions: Options with `permission_mode="dontAsk"`, an
@@ -412,7 +645,7 @@ def _build_options(
         name="reviewer",
         version="0.1.0",
         tools=[
-            _make_submit_finding_tool(collector),
+            _make_submit_finding_tool(collector, changed_files),
             _make_submit_verdict_tool(collector, criteria),
         ],
     )
@@ -503,6 +736,7 @@ async def run_review(
     was_truncated: bool,
     system_prompt: str,
     criteria: list[Criterion],
+    changed_files: list[ChangedFile],
     repo_root: Path,
     model: str,
     max_turns: int,
@@ -516,6 +750,10 @@ async def run_review(
         was_truncated: Whether `diff_context` was truncated to fit budget.
         system_prompt: The composed system prompt.
         criteria: The loaded review criteria.
+        changed_files: The in-scope files `diff_context` was rendered from.
+            `submit_finding` rejects any finding not anchored to a line of
+            these, so a hallucinated line number costs one retry rather than
+            the whole review at publish time.
         repo_root: The consumer's checkout root, used as `cwd`.
         model: The model to run the review with.
         max_turns: The agent turn budget.
@@ -534,6 +772,7 @@ async def run_review(
         allow_repo_exploration=allow_repo_exploration,
         collector=collector,
         criteria=criteria,
+        changed_files=changed_files,
     )
     prompt = _build_user_prompt(pr_metadata, diff_context, was_truncated)
 

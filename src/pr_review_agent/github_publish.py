@@ -20,10 +20,11 @@ from pr_review_agent.github_diff import (
     HTTP_TIMEOUT_SECONDS,
     GitHubApiError,
     build_client,
+    rate_limit_reason,
     resolve_repo,
 )
 from pr_review_agent.logging_config import redact
-from pr_review_agent.models import ReviewOutput
+from pr_review_agent.models import ReviewEvent, ReviewOutput
 from pr_review_agent.output import build_review_payload
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,15 @@ def _raise_for_publish_error(exc: Exception, context: str) -> GitHubPublishError
     """
     if isinstance(exc, RequestFailed):
         status = exc.response.status_code
+        if status in (403, 429):
+            limited = rate_limit_reason(exc.response)
+            if limited is not None:
+                return GitHubPublishError(
+                    f"GitHub rate-limited posting the review for {context} "
+                    f"(HTTP {status}): {limited}. This is not a permissions "
+                    "problem — the review is saved in the local artifacts; "
+                    "wait and re-run."
+                )
         if status == 403:
             return GitHubPublishError(
                 f"GitHub rejected posting the review for {context} (HTTP 403). "
@@ -78,7 +88,7 @@ def _raise_for_publish_error(exc: Exception, context: str) -> GitHubPublishError
             )
         return GitHubPublishError(
             f"GitHub returned HTTP {status} while posting the review for "
-            f"{context}: {redact(exc.response.text[:500])}"
+            f"{context}: {redact(exc.response.text)[:500]}"
         )
     if isinstance(exc, RequestTimeout):
         return GitHubPublishError(
@@ -118,6 +128,15 @@ def _post(
         name: Repository name.
         pr_number: The pull request number to review.
         payload: `{"event", "body", "comments"}`, per `build_review_payload`.
+
+    Returns:
+        None: The created review is not read back; callers only need to know
+        whether the call raised.
+
+    Raises:
+        RequestFailed: If GitHub answers with an error status.
+        RequestTimeout: If the call exceeds `HTTP_TIMEOUT_SECONDS`.
+        RequestError: For any other transport-level failure.
     """
     github.rest.pulls.create_review(
         owner,
@@ -172,7 +191,11 @@ def post_review(
     try:
         _post(github, owner, name, pr_number, payload)
     except (RequestFailed, RequestTimeout, RequestError) as exc:
-        if not _is_approval_not_permitted(exc):
+        # The event check is not redundant with the marker: it is what makes
+        # the docstring's promise ("if the model's verdict was APPROVE") true
+        # in code, so a future marker match on a non-APPROVE payload can't
+        # silently repost something GitHub already rejected on other grounds.
+        if posted_event != ReviewEvent.APPROVE or not _is_approval_not_permitted(exc):
             raise _raise_for_publish_error(exc, context) from exc
 
         logger.warning(

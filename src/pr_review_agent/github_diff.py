@@ -13,7 +13,9 @@ import shutil
 import ssl
 import subprocess
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import truststore
 from githubkit import GitHub
@@ -43,10 +45,16 @@ class GitHubApiError(RuntimeError):
 
 @dataclass(frozen=True)
 class PullRequestMetadata:
-    """A pull request's identifying fields and its changed-file paths.
+    """A pull request's identifying fields and its changed-file count.
 
     `state`/`merged` let a caller skip reviewing a PR nobody can act on
     anymore before fetching the diff or running the agent at all.
+
+    `changed_file_count` is a count rather than the path list it used to be:
+    the only thing anything ever asked was whether it was zero, and building
+    the list meant paginating `pulls.list_files` — up to 30 extra API calls
+    for a boolean that `pulls.get` already answers in the response it returns
+    anyway. The paths themselves come from the diff, via `diff_parser`.
     """
 
     number: int
@@ -54,7 +62,7 @@ class PullRequestMetadata:
     url: str
     base_ref_name: str
     head_ref_name: str
-    files: list[str]
+    changed_file_count: int
     state: str
     merged: bool
 
@@ -104,8 +112,16 @@ def _resolve_token() -> str:
     )
 
 
+@lru_cache(maxsize=1)
 def build_client() -> GitHub:
-    """Construct an authenticated githubkit client.
+    """Construct (once) an authenticated githubkit client.
+
+    Cached because a single run touches the API from several independent
+    module-level functions, and building a client per call also rebuilt a
+    `truststore` SSL context and threw away the connection pool each time.
+    The token is read from the environment and never changes mid-process.
+    `lru_cache` does not cache exceptions, so a missing token still raises on
+    every call.
 
     Returns:
         GitHub: A client with an explicit timeout and OS-trust-store TLS.
@@ -121,6 +137,33 @@ def build_client() -> GitHub:
     )
 
 
+def rate_limit_reason(response: Any) -> str | None:
+    """Explain a rejection that is really a rate limit, or None if it isn't one.
+
+    GitHub returns **403** for its secondary rate limit — the same status as a
+    genuinely missing permission. Reporting one as the other sends the operator
+    off to fix a token scope that was never wrong, so the two are told apart by
+    the headers GitHub attaches: `Retry-After` on the secondary limit,
+    `x-ratelimit-remaining: 0` on the primary one.
+
+    Args:
+        response: The HTTP response carried by the githubkit exception.
+
+    Returns:
+        str | None: A phrase describing the limit and, where GitHub said so,
+        when to retry — or None when this rejection is not a rate limit.
+    """
+    headers = getattr(response, "headers", None) or {}
+    retry_after = headers.get("retry-after")
+    if retry_after:
+        return f"GitHub asked for a {retry_after}s wait (`Retry-After`)"
+    if headers.get("x-ratelimit-remaining") == "0":
+        reset = headers.get("x-ratelimit-reset")
+        when = f", resetting at unix time {reset}" if reset else ""
+        return f"the request quota is exhausted (`x-ratelimit-remaining: 0`{when})"
+    return None
+
+
 def _raise_for_github_error(exc: Exception, context: str) -> GitHubApiError:
     """Translate a githubkit exception into a `GitHubApiError` with guidance.
 
@@ -133,6 +176,14 @@ def _raise_for_github_error(exc: Exception, context: str) -> GitHubApiError:
     """
     if isinstance(exc, RequestFailed):
         status = exc.response.status_code
+        if status in (403, 429):
+            limited = rate_limit_reason(exc.response)
+            if limited is not None:
+                return GitHubApiError(
+                    f"GitHub rate-limited the request for {context} "
+                    f"(HTTP {status}): {limited}. This is not a permissions "
+                    "problem — wait and re-run."
+                )
         if status in (401, 403):
             return GitHubApiError(
                 f"GitHub rejected the token while fetching {context} "
@@ -146,7 +197,7 @@ def _raise_for_github_error(exc: Exception, context: str) -> GitHubApiError:
             )
         return GitHubApiError(
             f"GitHub returned HTTP {status} while fetching {context}: "
-            f"{redact(exc.response.text[:500])}"
+            f"{redact(exc.response.text)[:500]}"
         )
     if isinstance(exc, RequestTimeout):
         return GitHubApiError(
@@ -219,20 +270,14 @@ def get_pr_metadata(pr_number: int, repo: str | None = None) -> PullRequestMetad
 
     try:
         pull_request = github.rest.pulls.get(owner, name, pr_number).parsed_data
-        files = [
-            entry.filename
-            for entry in github.rest.paginate(
-                github.rest.pulls.list_files,
-                owner=owner,
-                repo=name,
-                pull_number=pr_number,
-            )
-        ]
     except (RequestFailed, RequestTimeout, RequestError) as exc:
         raise _raise_for_github_error(exc, context) from exc
 
+    changed_file_count = pull_request.changed_files
     logger.info(
-        "Fetched metadata for PR #%d: %d changed file(s)", pr_number, len(files)
+        "Fetched metadata for PR #%d: %d changed file(s)",
+        pr_number,
+        changed_file_count,
     )
     return PullRequestMetadata(
         number=pull_request.number,
@@ -240,7 +285,7 @@ def get_pr_metadata(pr_number: int, repo: str | None = None) -> PullRequestMetad
         url=pull_request.html_url,
         base_ref_name=pull_request.base.ref,
         head_ref_name=pull_request.head.ref,
-        files=files,
+        changed_file_count=changed_file_count,
         state=pull_request.state,
         merged=bool(pull_request.merged),
     )

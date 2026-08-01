@@ -1,9 +1,9 @@
 ---
 change_id: ai-code-review
 title: PR Review Action — reusable composite GitHub Action
-status: implemented
+status: impl_reviewed
 created: 2026-07-30
-updated: 2026-07-31
+updated: 2026-08-01
 archived_at: null
 ---
 
@@ -330,3 +330,83 @@ Actions tab, live `--verbose` logs during the review step, and a real inline
 PR comment — all three required course-assignment deliverables satisfied
 within this one repo. `plan.md`'s Progress section is now fully checked; all
 12 phases implemented.
+
+**Implementation review of phases 10-12 + the four post-triage commits
+(2026-07-31): REJECTED — 1 critical, 8 warnings, 1 observation. Triaged
+2026-08-01 — see the "Review triage" section at the end of this file.** See `reviews/impl-review-phases-10-12.md`. All automated criteria
+re-ran green (pytest 78 passed / 1 skipped · ruff · ruff format · pyright 0
+errors), `action.yml` matches the Phase 10 draft input-for-input, and both open
+user items from the phases 4-9 review are resolved (`token.txt` gone and now
+gitignored; `smoke-criteria.md` tracked). The verdict is driven by:
+- **F1 (critical)** — `cli.py`'s `_repo_relative` decides base-ref-vs-disk
+  sourcing with `path.resolve()`, which follows symlinks. A PR that replaces
+  `AGENTS.md` (the default `--rules-file`) with a symlink to
+  `/proc/self/environ` resolves *outside* the checkout, which the code treats
+  as "carries the caller's authority" and reads from disk — putting the
+  runner's env, including `GH_TOKEN` and the Anthropic token, into the system
+  prompt. The trust decision is made from the input the PR author controls, and
+  it fails open. This is the same F4 amendment the phases 4-9 review added; the
+  containment check has a hole the review didn't anticipate.
+- **F2** — `README.md` is still the Phase-0 stub. Phase 8 specified its full
+  contents, and no Progress checkbox gated it, so it was never written. Risk
+  #11 names the README warning as the *only* mitigation for the "both Anthropic
+  auth forms set" case, so that mitigation currently does not exist.
+- **F3** — `action.yml` interpolates every `${{ inputs.* }}` textually into a
+  bash script body (the shape `plan.md` itself specifies), so a consumer wiring
+  an input to `github.event.comment.body` gets shell injection on the runner.
+
+
+## Review triage (2026-08-01)
+
+All 10 findings from `reviews/impl-review-phases-10-12.md` addressed in one
+pass — 9 fixed, F6 partially. Gates after: **pytest 114 passed / 3 skipped**
+(was 78/1) · ruff · ruff format · pyright 0 errors.
+
+- **F1 (critical), symlink trust escape** — `_repo_relative` now classifies
+  lexically (`os.path.abspath`), so a head-authored symlink can no longer move
+  the base-ref-vs-disk decision; a path that is in-repo by literal name but
+  resolves outside is rejected outright (exit `3`). The two new tests skip on
+  Windows for want of symlink privileges and run on the Linux CI runner;
+  behavior was verified locally with a directory junction.
+- **F2, missing README** — written to `plan.md`'s Phase 8 spec, including the
+  Risk #11 both-auth-forms warning that was its only mitigation. Progress item
+  8.5 added so the gap can't recur silently.
+- **F3, `action.yml` shell injection** — every input now reaches the script
+  through `env:`; no `${{ }}` remains in any `run:` body. Verified by running
+  the extracted script against a stubbed `uv`, including an injection payload
+  that arrives as one literal argv element.
+- **F4, hallucinated line numbers** — `submit_finding` validates
+  `(path, line, side)` against the diff and returns a retryable error naming
+  the valid anchors, instead of letting one bad line 422 the entire review at
+  publish time. Uses `ChangedFile.added/removed_line_numbers`, which nothing
+  had been consuming.
+- **F5, Glob pattern bypass** — the PreToolUse guard now containment-checks
+  Glob's `pattern` (its literal prefix), which needs no `path` argument and so
+  never reached the guard before. Grep's contents regex stays exempt.
+- **F6, GitHub boundary** — *error mapping only.* A rate-limited 403/429 is
+  no longer reported as a permissions problem. **The retry half was
+  deliberately skipped and is still open:** all five call sites remain
+  single-shot, so a transient 502 on `post_review` still loses a completed,
+  paid-for review with exit `6`.
+- **F7, WebFetch** — `_DISALLOWED_TOOLS` now names all ten mutation/egress
+  tools; `WebFetch` was the one egress path resting on SDK defaults alone.
+- **F8, untested modules** — `tests/test_review_agent.py` (25 tests) and
+  `tests/test_github_publish.py` (5 tests) added; the plan's "no unit tests for
+  this module" waiver is struck through and superseded.
+- **F9, plan drift** — Phase 2 gained the deleted-file placeholder bullet, and
+  Phases 3, 5, 8 and 10 were amended for everything this triage changed. The
+  plan is source of truth again for every phase touched.
+- **F10, nine minor items** — all fixed. Notably: `--publish --format all` now
+  prints console output (with a PUBLISHED banner, not a false DRY RUN); status
+  messages moved off stdout to the stderr logger; `build_client` is cached (six
+  clients and six TLS contexts per run → one); `PullRequestMetadata.files`
+  became `changed_file_count`, dropping up to 30 API calls per run for a
+  boolean `pulls.get` already answered.
+
+**Open user action item:** `self-test.yml`'s dogfood jobs are now skipped for
+forks and carry an explicit SECURITY comment, but a contributor with push
+access can still read `OPENROUTER_API_KEY` by editing the action in a PR — the
+jobs run the action from the PR's own head, which is the point of dogfooding.
+The durable fix is a repository *environment* holding that secret with required
+reviewers, then `environment: dogfood` on both jobs. That is a repo-settings
+change nobody can make from inside these files.

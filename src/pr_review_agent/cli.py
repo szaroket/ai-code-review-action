@@ -13,6 +13,7 @@ publishing a completed review failed.
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -166,18 +167,64 @@ def _allow_repo_exploration(resolved_repo: tuple[str, str], repo_root: Path) -> 
 def _repo_relative(path: Path, repo_root: Path) -> str | None:
     """Express `path` relative to `repo_root`, or None if it falls outside.
 
+    The comparison is deliberately *lexical*. `Path.resolve()` follows
+    symlinks, and the checkout is the pull request's own head — so a PR that
+    replaced `AGENTS.md` with a symlink pointing outside the repository would
+    make its rules file resolve outside `repo_root`, be classified as external,
+    and thereby win the *higher* trust level in `_load_review_input`.
+    `os.path.abspath` normalises the process cwd and any `..` without touching
+    the filesystem, so the trust decision cannot be moved by anything the pull
+    request author controls.
+
     Args:
         path: The path to test, absolute or relative to the process cwd.
         repo_root: The local checkout root.
 
     Returns:
-        str | None: A repository-relative POSIX path, or None when `path`
-        resolves outside `repo_root` (or cannot be resolved at all).
+        str | None: A repository-relative POSIX path, or None when `path` lies
+        outside `repo_root` by literal path (or cannot be made absolute).
     """
     try:
-        return path.resolve().relative_to(repo_root.resolve()).as_posix()
+        literal = Path(os.path.abspath(path))
+        return literal.relative_to(Path(os.path.abspath(repo_root))).as_posix()
     except (ValueError, OSError):
         return None
+
+
+def _reject_symlink_escape(path: Path, repo_root: Path, what: str) -> None:
+    """Refuse an in-repo review-input path that resolves outside the checkout.
+
+    `_repo_relative` classifies lexically and the in-repo branch reads from the
+    base ref, so an escaping symlink can no longer leak a file on its own. It
+    still means the head checkout disagrees with the base ref about what this
+    path *is* — either an attack or a broken tree, and both are worth failing
+    loudly on rather than silently reviewing against the base-ref copy.
+
+    Args:
+        path: A review-input path already known to sit inside `repo_root` by
+            literal path.
+        repo_root: The local checkout root.
+        what: Short label for the error message, e.g. `"Rules file"`.
+
+    Returns:
+        None: Returns normally when `path` stays inside `repo_root`, or when
+        neither side can be resolved at all.
+
+    Raises:
+        OSError: If `path` resolves outside `repo_root`.
+    """
+    try:
+        resolved = path.resolve()
+        inside = resolved.is_relative_to(repo_root.resolve())
+    except OSError:
+        return
+    if not inside:
+        raise OSError(
+            f"{what} {path} is inside the checkout but resolves to {resolved}, "
+            "outside it. Refusing to read a path that escapes the repository: "
+            "it cannot be sourced from the base ref, and the checkout is the "
+            "pull request's own head."
+        )
 
 
 def _load_review_input(
@@ -203,7 +250,9 @@ def _load_review_input(
     part of the pull request, so they carry the caller's authority, not the
     author's. That is what lets a workflow point `--criteria-file` at criteria
     shipped alongside the action rather than at a file in the repo under
-    review.
+    review. Which side of that line a path falls on is decided lexically (see
+    `_repo_relative`), so the author cannot cross it with a symlink; a path
+    that is inside by literal name but escapes on disk is rejected outright.
 
     Args:
         path: The `--rules-file` / `--lessons-file` / `--criteria-file` value.
@@ -223,10 +272,13 @@ def _load_review_input(
         GitHubApiError: If the base-ref fetch fails for any reason other than
             the file being absent.
         OSError: If an on-disk read fails for a reason other than the file
-            being absent.
+            being absent, or if an in-repo path escapes the checkout through a
+            symlink.
         UnicodeDecodeError: If an on-disk file isn't valid UTF-8.
     """
     relative = _repo_relative(path, repo_root)
+    if relative is not None and not trust_head:
+        _reject_symlink_escape(path, repo_root, what)
     if trust_head or relative is None:
         try:
             return path.read_text(encoding="utf-8")
@@ -429,7 +481,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     if pr_metadata.state != "open":
         status = "merged" if pr_metadata.merged else pr_metadata.state
-        print(f"PR #{args.pr} is {status}; skipping review.")
+        logger.info("PR #%d is %s; skipping review.", args.pr, status)
         return EXIT_SUCCESS
 
     try:
@@ -438,8 +490,8 @@ async def main_async(args: argparse.Namespace) -> int:
         logger.error("%s", exc)
         return EXIT_GITHUB_FETCH_ERROR
 
-    if not pr_metadata.files:
-        print(f"PR #{args.pr} has no changed files; nothing to review.")
+    if pr_metadata.changed_file_count == 0:
+        logger.info("PR #%d has no changed files; nothing to review.", args.pr)
         return EXIT_SUCCESS
 
     repo_root = find_repo_root()
@@ -494,9 +546,10 @@ async def main_async(args: argparse.Namespace) -> int:
     changed_files = exclude_paths(parsed_diff, exclude_globs)
     in_scope = filter_in_scope_files(changed_files, scope_dirs)
     if scope_dirs and not in_scope:
-        print(
-            f"All {len(changed_files)} changed file(s) are out of scope "
-            f"({', '.join(scope_dirs)}); nothing to review."
+        logger.info(
+            "All %d changed file(s) are out of scope (%s); nothing to review.",
+            len(changed_files),
+            ", ".join(scope_dirs),
         )
         return EXIT_SUCCESS
 
@@ -511,6 +564,7 @@ async def main_async(args: argparse.Namespace) -> int:
             was_truncated=was_truncated,
             system_prompt=system_prompt,
             criteria=criteria,
+            changed_files=in_scope,
             repo_root=repo_root,
             model=args.model,
             max_turns=args.max_turns,
@@ -557,9 +611,13 @@ async def main_async(args: argparse.Namespace) -> int:
             _ensure_json_artifact(review_output, args.out_dir, was_capped, args.format)
             logger.error("%s Local artifacts were saved to %s.", exc, args.out_dir)
             return EXIT_PUBLISH_ERROR
-        print(
-            f"Posted {len(review_output.comments)} inline comment(s) to PR #{args.pr}."
+        logger.info(
+            "Posted %d inline comment(s) to PR #%d.",
+            len(review_output.comments),
+            args.pr,
         )
+        if args.format in ("console", "all"):
+            print_console(review_output, was_capped, published=True)
         return EXIT_SUCCESS
 
     if args.format in ("console", "all"):
