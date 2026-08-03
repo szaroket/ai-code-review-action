@@ -6,13 +6,16 @@ from typing import Any
 
 import pytest
 
+from pr_review_agent import review_agent
 from pr_review_agent.diff_parser import ChangedFile
+from pr_review_agent.github_diff import PullRequestMetadata
 from pr_review_agent.models import DiffSide, Finding, Severity
 from pr_review_agent.review_agent import (
     _anchor_error,
     _build_options,
     _Collector,
     _make_repo_path_guard,
+    run_review,
 )
 
 
@@ -204,3 +207,54 @@ def test_exploration_tools_are_dropped_on_a_repo_mismatch(tmp_path: Path) -> Non
     options = _options(tmp_path, allow_repo_exploration=False)
     for tool in ("Read", "Grep", "Glob"):
         assert tool not in options.allowed_tools
+
+
+def _pr_metadata() -> PullRequestMetadata:
+    return PullRequestMetadata(
+        number=1,
+        title="Add a handler",
+        url="https://github.com/owner/name/pull/1",
+        base_ref_name="main",
+        head_ref_name="feature",
+        changed_file_count=1,
+        state="open",
+        merged=False,
+    )
+
+
+def test_run_review_survives_a_mid_run_sdk_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A max-turns-style in-run failure must not crash the whole review.
+
+    The SDK's own control loop raises a bare `Exception` for this case
+    (`_internal/query.py`'s `receive_messages`, not a `ClaudeSDKError`
+    subclass), so `run_review` is the only place that can turn it into a
+    reportable result instead of an unhandled traceback.
+    """
+
+    async def _boom(*, prompt: str, options: object) -> Any:
+        if False:  # pragma: no cover - makes this an async generator
+            yield
+        raise RuntimeError("Reached maximum number of turns (5)")
+
+    monkeypatch.setattr(review_agent, "query", _boom)
+
+    result = asyncio.run(
+        run_review(
+            pr_metadata=_pr_metadata(),
+            diff_context="diff --git a/x b/x\n",
+            was_truncated=False,
+            system_prompt="be a reviewer",
+            criteria=[],
+            changed_files=[],
+            repo_root=tmp_path,
+            model="claude-sonnet-5",
+            max_turns=5,
+            allow_repo_exploration=False,
+        )
+    )
+
+    assert result.sdk_success is False
+    assert result.verdict is None
+    assert result.findings == []

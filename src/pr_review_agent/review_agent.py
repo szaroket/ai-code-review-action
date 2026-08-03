@@ -761,7 +761,15 @@ async def run_review(
 
     Returns:
         ReviewRunResult: The collected findings, verdict (if any), and
-        whether the SDK itself reported a successful run.
+        whether the SDK itself reported a successful run. A mid-run SDK
+        failure (e.g. max-turns exhaustion) is reported as `sdk_success=False`
+        here rather than raised, so the caller always gets back whatever the
+        collector gathered before the failure.
+
+    Raises:
+        ClaudeSDKError: If the SDK fails before or outside the message loop
+            (e.g. the CLI binary is missing) — an environment problem, not a
+            reviewable run outcome, so it is left for the caller to handle.
     """
     collector = _Collector()
     options = _build_options(
@@ -777,19 +785,31 @@ async def run_review(
     prompt = _build_user_prompt(pr_metadata, diff_context, was_truncated)
 
     sdk_success = False
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    logger.debug("Assistant: %s", block.text)
-        elif isinstance(message, ResultMessage):
-            sdk_success = message.subtype == "success" and not message.is_error
-            logger.info(
-                "Review run finished: subtype=%s is_error=%s num_turns=%d",
-                message.subtype,
-                message.is_error,
-                message.num_turns,
-            )
+    try:
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        logger.debug("Assistant: %s", block.text)
+            elif isinstance(message, ResultMessage):
+                sdk_success = message.subtype == "success" and not message.is_error
+                logger.info(
+                    "Review run finished: subtype=%s is_error=%s num_turns=%d",
+                    message.subtype,
+                    message.is_error,
+                    message.num_turns,
+                )
+    except Exception as exc:  # noqa: BLE001
+        # The SDK's own control loop raises a bare `Exception` for an
+        # in-run error result (e.g. max-turns exhaustion) rather than a
+        # `ClaudeSDKError` subclass — see `_internal/query.py`'s
+        # `receive_messages`. That leaves this `except` as the only reliable
+        # boundary between "the agent loop failed mid-run" and this
+        # function's caller; letting it propagate would crash the whole CLI
+        # before `cli.py`'s exit-code contract ever saw the failure, and
+        # would discard whatever the collector already gathered.
+        logger.error("Agent SDK run failed mid-review: %s", exc)
+        sdk_success = False
 
     return ReviewRunResult(
         findings=collector.findings,

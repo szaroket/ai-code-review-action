@@ -28,6 +28,7 @@ from pr_review_agent.models import (
     DiffSide,
     Finding,
     ReviewEvent,
+    ReviewOutput,
     ReviewVerdict,
     Severity,
 )
@@ -333,6 +334,46 @@ def test_missing_verdict_exits_five(
 
     monkeypatch.setattr(cli, "run_review", _no_verdict)
     assert _run_cli(tmp_path) == EXIT_INCOMPLETE_RUN
+
+
+@pytest.mark.usefixtures("happy_path")
+def test_sdk_failure_never_publishes_even_with_the_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed run must fail the check, not post an ambiguous PR comment.
+
+    Only two comment shapes are meaningful on a PR: a clean pass (verdict +
+    per-criterion scores, even with zero findings) or one with findings to
+    fix. A crashed or incomplete run is neither, so it must never publish —
+    the failing exit code plus the local artifact are the signal.
+    """
+
+    async def _failed(**kwargs: object) -> ReviewRunResult:
+        return ReviewRunResult(findings=[], verdict=None, sdk_success=False)
+
+    def _explode(pr: int, review_output: ReviewOutput, repo: str) -> None:
+        raise AssertionError("a failed run must never publish a comment")
+
+    monkeypatch.setattr(cli, "run_review", _failed)
+    monkeypatch.setattr(cli, "post_review", _explode)
+
+    assert _run_cli(tmp_path, "--publish") == EXIT_AGENT_ERROR
+
+
+@pytest.mark.usefixtures("happy_path")
+def test_missing_verdict_never_publishes_even_with_the_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _no_verdict(**kwargs: object) -> ReviewRunResult:
+        return ReviewRunResult(findings=[_finding()], verdict=None, sdk_success=True)
+
+    def _explode(pr: int, review_output: ReviewOutput, repo: str) -> None:
+        raise AssertionError("an incomplete run must never publish a comment")
+
+    monkeypatch.setattr(cli, "run_review", _no_verdict)
+    monkeypatch.setattr(cli, "post_review", _explode)
+
+    assert _run_cli(tmp_path, "--publish") == EXIT_INCOMPLETE_RUN
 
 
 @pytest.mark.usefixtures("happy_path")

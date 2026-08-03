@@ -600,6 +600,13 @@ async def main_async(args: argparse.Namespace) -> int:
             len(review_output.comments),
             args.out_dir,
         )
+        # Deliberately never published, `--publish` or not: a PR comment
+        # should only ever be one of two shapes — a clean pass (verdict +
+        # per-criterion scores, even with zero findings) or one with findings
+        # to fix. A crashed or incomplete run is neither, and posting an
+        # "INCOMPLETE — NO VERDICT PRODUCED" comment reads ambiguously next
+        # to a genuine clean pass. The failing exit code is the signal here;
+        # local artifacts (written above) carry the detail for debugging.
         if args.format in ("console", "all"):
             print_console(review_output, was_capped)
         return exit_code
