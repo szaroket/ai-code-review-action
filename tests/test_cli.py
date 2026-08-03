@@ -28,6 +28,7 @@ from pr_review_agent.models import (
     DiffSide,
     Finding,
     ReviewEvent,
+    ReviewOutput,
     ReviewVerdict,
     Severity,
 )
@@ -333,6 +334,90 @@ def test_missing_verdict_exits_five(
 
     monkeypatch.setattr(cli, "run_review", _no_verdict)
     assert _run_cli(tmp_path) == EXIT_INCOMPLETE_RUN
+
+
+@pytest.mark.usefixtures("happy_path")
+def test_sdk_failure_still_posts_a_summary_comment_when_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A silently-swallowed failure is worse than no review at all.
+
+    An `sdk_success=False` run must still reach GitHub with whatever it
+    collected (here: the incomplete-run banner, no findings), so the PR shows
+    *something* instead of a check that never posted at all.
+    """
+    posted: list[str] = []
+
+    async def _failed(**kwargs: object) -> ReviewRunResult:
+        return ReviewRunResult(findings=[], verdict=None, sdk_success=False)
+
+    def _record(pr: int, review_output: ReviewOutput, repo: str) -> None:
+        posted.append(review_output.summary_body)
+
+    monkeypatch.setattr(cli, "run_review", _failed)
+    monkeypatch.setattr(cli, "post_review", _record)
+
+    assert _run_cli(tmp_path, "--publish") == EXIT_AGENT_ERROR
+    assert posted, "the incomplete-run branch never called post_review"
+
+
+@pytest.mark.usefixtures("happy_path")
+def test_missing_verdict_still_posts_a_summary_comment_when_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    posted: list[str] = []
+
+    async def _no_verdict(**kwargs: object) -> ReviewRunResult:
+        return ReviewRunResult(findings=[_finding()], verdict=None, sdk_success=True)
+
+    def _record(pr: int, review_output: ReviewOutput, repo: str) -> None:
+        posted.append(review_output.summary_body)
+
+    monkeypatch.setattr(cli, "run_review", _no_verdict)
+    monkeypatch.setattr(cli, "post_review", _record)
+
+    assert _run_cli(tmp_path, "--publish") == EXIT_INCOMPLETE_RUN
+    assert len(posted) == 1
+
+
+@pytest.mark.usefixtures("happy_path")
+def test_failed_run_does_not_publish_without_the_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without `--publish`, a failed run must not touch GitHub at all."""
+
+    async def _failed(**kwargs: object) -> ReviewRunResult:
+        return ReviewRunResult(findings=[], verdict=None, sdk_success=False)
+
+    def _explode(pr: int, review_output: ReviewOutput, repo: str) -> None:
+        raise AssertionError("post_review must not run without --publish")
+
+    monkeypatch.setattr(cli, "run_review", _failed)
+    monkeypatch.setattr(cli, "post_review", _explode)
+
+    assert _run_cli(tmp_path) == EXIT_AGENT_ERROR
+
+
+@pytest.mark.usefixtures("happy_path")
+def test_publish_error_on_a_failed_run_keeps_the_original_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A publish failure on top of an already-failed run must not mask it.
+
+    The run's own failure (4/5) is the reportable reason; escalating to 6
+    here would hide *why* the run failed behind a secondary GitHub error.
+    """
+
+    async def _no_verdict(**kwargs: object) -> ReviewRunResult:
+        return ReviewRunResult(findings=[_finding()], verdict=None, sdk_success=True)
+
+    def _boom(pr: int, review_output: ReviewOutput, repo: str) -> None:
+        raise GitHubPublishError("403 from GitHub")
+
+    monkeypatch.setattr(cli, "run_review", _no_verdict)
+    monkeypatch.setattr(cli, "post_review", _boom)
+
+    assert _run_cli(tmp_path, "--publish") == EXIT_INCOMPLETE_RUN
 
 
 @pytest.mark.usefixtures("happy_path")
