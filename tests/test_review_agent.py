@@ -1,10 +1,12 @@
 """Unit tests for the pure, SDK-free parts of the agent loop."""
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
+from claude_agent_sdk import AssistantMessage, ToolUseBlock
 
 from pr_review_agent import review_agent
 from pr_review_agent.diff_parser import ChangedFile
@@ -258,3 +260,47 @@ def test_run_review_survives_a_mid_run_sdk_error(
     assert result.sdk_success is False
     assert result.verdict is None
     assert result.findings == []
+
+
+def test_run_review_logs_each_tool_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stuck run must be diagnosable from CI logs: which tool, how often.
+
+    Before this, `run_review` only logged assistant text and blocked paths —
+    a turn spent purely on tool calls (the common case for a run that never
+    reaches `submit_finding`) left no trace at all.
+    """
+
+    async def _one_tool_call(*, prompt: str, options: object) -> Any:
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="tool_1", name="Read", input={"file_path": "backend/app/main.py"}
+                )
+            ],
+            model="claude-sonnet-5",
+        )
+
+    monkeypatch.setattr(review_agent, "query", _one_tool_call)
+
+    with caplog.at_level(logging.DEBUG, logger="pr_review_agent"):
+        asyncio.run(
+            run_review(
+                pr_metadata=_pr_metadata(),
+                diff_context="diff --git a/x b/x\n",
+                was_truncated=False,
+                system_prompt="be a reviewer",
+                criteria=[],
+                changed_files=[],
+                repo_root=tmp_path,
+                model="claude-sonnet-5",
+                max_turns=5,
+                allow_repo_exploration=False,
+            )
+        )
+
+    assert any(
+        "Tool call: Read" in record.message and "backend/app/main.py" in record.message
+        for record in caplog.records
+    )

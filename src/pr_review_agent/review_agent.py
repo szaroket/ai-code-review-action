@@ -21,6 +21,7 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     TextBlock,
+    ToolUseBlock,
     create_sdk_mcp_server,
     query,
     tool,
@@ -28,6 +29,7 @@ from claude_agent_sdk import (
 
 from pr_review_agent.diff_parser import ChangedFile
 from pr_review_agent.github_diff import PullRequestMetadata
+from pr_review_agent.logging_config import redact
 from pr_review_agent.models import (
     Criterion,
     CriterionResult,
@@ -729,6 +731,27 @@ def _build_user_prompt(
     return "\n".join(lines)
 
 
+_MAX_LOGGED_TOOL_INPUT_CHARS = 300
+
+
+def _render_tool_input(tool_input: dict[str, Any]) -> str:
+    """Render a tool call's input arguments for a single debug log line.
+
+    Args:
+        tool_input: The `ToolUseBlock.input` dict.
+
+    Returns:
+        str: A compact, length-capped rendering — turn-by-turn tool-call
+        logging exists to diagnose *which* tool ate the budget on a stuck
+        run, not to reproduce its full arguments (e.g. a `submit_finding`
+        comment can run long).
+    """
+    rendered = str(tool_input)
+    if len(rendered) > _MAX_LOGGED_TOOL_INPUT_CHARS:
+        rendered = rendered[:_MAX_LOGGED_TOOL_INPUT_CHARS] + "...(truncated)"
+    return rendered
+
+
 async def run_review(
     *,
     pr_metadata: PullRequestMetadata,
@@ -791,6 +814,17 @@ async def run_review(
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         logger.debug("Assistant: %s", block.text)
+                    elif isinstance(block, ToolUseBlock):
+                        # Turns are otherwise a black box in CI logs: text
+                        # commentary is the only other thing logged here, and
+                        # a turn spent purely on tool calls produces none. A
+                        # run that burns its whole budget without a single
+                        # finding is undiagnosable without this line.
+                        logger.debug(
+                            "Tool call: %s(%s)",
+                            block.name,
+                            redact(_render_tool_input(block.input)),
+                        )
             elif isinstance(message, ResultMessage):
                 sdk_success = message.subtype == "success" and not message.is_error
                 logger.info(
