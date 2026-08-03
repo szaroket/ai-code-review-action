@@ -45,6 +45,14 @@ logger = logging.getLogger(__name__)
 
 _EXPLORATION_TOOLS = ["Read", "Grep", "Glob"]
 _MCP_TOOLS = ["mcp__reviewer__submit_finding", "mcp__reviewer__submit_review_verdict"]
+# Observed live (HomeMedicineCabinet PR #58, this action's own PR #12): the
+# system prompt's "do not go on an open-ended exploration" instruction is not
+# self-enforcing. A diff touching anything the rules file flags as sensitive
+# (there: a redaction rule) sent the model on an unbounded Read/Grep/Glob
+# chase — 20 calls across 15 turns, every one of them exploration, never once
+# converging on `submit_finding`/`submit_review_verdict`. Advice alone did not
+# stop it; this cap does, in `_make_repo_path_guard` below.
+_MAX_EXPLORATION_TOOL_CALLS = 8
 # Every mutation and egress tool the SDK ships, named explicitly. They are all
 # already absent from `allowed_tools`; listing them here too is the second half
 # of the defence in depth described in `_build_options`. `WebFetch` matters most
@@ -542,6 +550,13 @@ def _make_repo_path_guard(repo_root: Path) -> Any:
     environment and emitting it as a review finding. This hook is the boundary
     that stops it.
 
+    It also enforces `_MAX_EXPLORATION_TOOL_CALLS`: a per-run counter, closed
+    over below, of every Read/Grep/Glob call this hook sees (allowed or
+    denied — a rejected guess still spent a turn). Once exhausted, every
+    further exploration call is denied with a message telling the model to
+    judge from the diff instead, regardless of whether the path itself would
+    have been fine.
+
     Deliberately a hook rather than `can_use_tool`: `allowed_tools` lists the
     exploration tools by bare name, which auto-approves them *before* the
     permission callback is consulted (the SDK reports this as
@@ -557,11 +572,12 @@ def _make_repo_path_guard(repo_root: Path) -> Any:
         Any: A `HookCallback` suitable for a `HookMatcher`'s `hooks` list.
     """
     resolved_root = repo_root.resolve()
+    calls_made = 0
 
     async def guard(
         input_data: HookInput, tool_use_id: str | None, context: HookContext
     ) -> HookJSONOutput:
-        """Deny the call if any path argument resolves outside `repo_root`.
+        """Deny the call if the exploration budget is spent or a path escapes.
 
         Args:
             input_data: The PreToolUse payload, carrying `tool_name` and
@@ -571,8 +587,19 @@ def _make_repo_path_guard(repo_root: Path) -> Any:
 
         Returns:
             HookJSONOutput: An empty dict to let the call proceed, or a deny
-            decision naming the offending argument.
+            decision naming the offending argument or the spent budget.
         """
+        nonlocal calls_made
+        calls_made += 1
+        if calls_made > _MAX_EXPLORATION_TOOL_CALLS:
+            return _deny(
+                f"Exploration budget spent: {_MAX_EXPLORATION_TOOL_CALLS} "
+                "Read/Grep/Glob calls already made this run. Stop exploring "
+                "the repository — judge from the diff you were given. Call "
+                "submit_finding for anything you are reasonably confident "
+                "about, then submit_review_verdict now."
+            )
+
         payload = cast(dict[str, Any], input_data)
         tool_input = payload.get("tool_input") or {}
         for arg_name in _PATH_ARG_NAMES:

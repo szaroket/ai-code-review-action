@@ -168,6 +168,64 @@ def test_guard_does_not_treat_a_grep_regex_as_a_path(tmp_path: Path) -> None:
     assert _guard_decision(tmp_path, "Grep", pattern="/etc/passwd|../../secret") is None
 
 
+def _call_guard(guard: Any, tool_name: str, **tool_input: Any) -> str | None:
+    """Invoke an already-built guard once; returns the decision, or None to allow."""
+    result = asyncio.run(
+        guard(
+            {  # pyright: ignore[reportArgumentType] - partial PreToolUse payload
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+            },
+            None,
+            None,  # pyright: ignore[reportArgumentType] - context is unused
+        )
+    )
+    specific = result.get("hookSpecificOutput")
+    if specific is None:
+        return None
+    return specific["permissionDecision"]
+
+
+def test_guard_allows_calls_up_to_the_exploration_budget(tmp_path: Path) -> None:
+    """A run genuinely needing a handful of targeted reads must not be cut short."""
+    (tmp_path / "src").mkdir()
+    guard = _make_repo_path_guard(tmp_path)
+    for _ in range(review_agent._MAX_EXPLORATION_TOOL_CALLS):
+        assert _call_guard(guard, "Read", file_path="src") is None
+
+
+def test_guard_denies_once_the_exploration_budget_is_spent(tmp_path: Path) -> None:
+    """Advice alone did not stop the model from exploring indefinitely; this must."""
+    (tmp_path / "src").mkdir()
+    guard = _make_repo_path_guard(tmp_path)
+    for _ in range(review_agent._MAX_EXPLORATION_TOOL_CALLS):
+        _call_guard(guard, "Read", file_path="src")
+
+    assert _call_guard(guard, "Read", file_path="src") == "deny"
+
+
+def test_guard_counts_a_denied_call_toward_the_budget_too(tmp_path: Path) -> None:
+    """A rejected out-of-repo guess still spent a turn; it must still count."""
+    guard = _make_repo_path_guard(tmp_path)
+    for _ in range(review_agent._MAX_EXPLORATION_TOOL_CALLS):
+        assert _call_guard(guard, "Read", file_path="/etc/passwd") == "deny"
+
+    result = asyncio.run(
+        guard(
+            {  # pyright: ignore[reportArgumentType] - partial PreToolUse payload
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/etc/passwd"},
+            },
+            None,
+            None,  # pyright: ignore[reportArgumentType] - context is unused
+        )
+    )
+    reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "budget" in reason.lower()
+
+
 def _options(tmp_path: Path, *, allow_repo_exploration: bool = True) -> Any:
     return _build_options(
         system_prompt="review this",
