@@ -99,13 +99,13 @@ def _findings_breakdown(findings: list[Finding]) -> str:
         message when `findings` is empty.
     """
     if not findings:
-        return "No findings."
+        return "**No findings.**"
 
     counts = Counter(finding.severity for finding in findings)
     parts = [
         f"{counts[severity]} {severity}" for severity in Severity if counts[severity]
     ]
-    return f"Findings: {', '.join(parts)} ({len(findings)} total)"
+    return f"**Findings**: {', '.join(parts)} ({len(findings)} total)"
 
 
 def build_summary(findings: list[Finding], verdict: ReviewVerdict | None) -> str:
@@ -134,8 +134,11 @@ def build_summary(findings: list[Finding], verdict: ReviewVerdict | None) -> str
         lines.append("")
         for score in verdict.criteria:
             icon = _CRITERION_ICONS[score.score]
-            lines.append(f"{icon} {score.name}: {score.score} — {score.rationale}")
-        lines.append("")
+            # Blank line between entries, and the name/score bolded: without
+            # both, GitHub renders the criteria as one run-on block that is
+            # hard to scan against nine criteria.
+            lines.append(f"{icon} **{score.name}: {score.score}** — {score.rationale}")
+            lines.append("")
 
     lines.append(_findings_breakdown(findings))
     return "\n".join(lines)

@@ -74,11 +74,18 @@ def test_cap_findings_over_limit_truncates() -> None:
 def test_build_summary_renders_criteria_before_findings_breakdown() -> None:
     summary = build_summary([_finding()], _verdict())
     criteria_index = summary.index("Naming")
-    breakdown_index = summary.index("Findings:")
+    breakdown_index = summary.index("**Findings**:")
     assert criteria_index < breakdown_index
-    assert "✅ Naming: pass" in summary
-    assert "❌ Tests: fail" in summary
+    assert "✅ **Naming: pass**" in summary
+    assert "❌ **Tests: fail**" in summary
     assert "1 warning (1 total)" in summary
+
+
+def test_build_summary_separates_criteria_with_a_blank_line() -> None:
+    """Without a blank line GitHub renders the criteria as one run-on block."""
+    summary = build_summary([_finding()], _verdict())
+    assert "\n\n❌ **Tests: fail**" in summary
+    assert "\n\n**Findings**:" in summary
 
 
 def test_build_summary_with_no_verdict_renders_incomplete_banner() -> None:
@@ -89,7 +96,7 @@ def test_build_summary_with_no_verdict_renders_incomplete_banner() -> None:
 
 def test_build_summary_with_no_findings_says_so() -> None:
     summary = build_summary([], _verdict())
-    assert "No findings." in summary
+    assert "**No findings.**" in summary
 
 
 def test_build_review_output_event_passes_through_from_verdict() -> None:
