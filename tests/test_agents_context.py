@@ -100,7 +100,7 @@ def test_system_prompt_orders_sections_as_documented() -> None:
         prompt.index("## Review Criteria"),
         prompt.index("## Repository Rules"),
         prompt.index("## Additional Lessons / Pitfalls"),
-        prompt.index("You may use the Read, Grep, and Glob tools"),
+        prompt.index("You have no Read, Grep, or Glob tools"),
         prompt.index("call `submit_finding` once"),
         prompt.index("After all `submit_finding` calls are done"),
     ]

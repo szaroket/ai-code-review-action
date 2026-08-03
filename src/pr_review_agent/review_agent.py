@@ -21,6 +21,7 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     TextBlock,
+    ToolUseBlock,
     create_sdk_mcp_server,
     query,
     tool,
@@ -28,6 +29,7 @@ from claude_agent_sdk import (
 
 from pr_review_agent.diff_parser import ChangedFile
 from pr_review_agent.github_diff import PullRequestMetadata
+from pr_review_agent.logging_config import redact
 from pr_review_agent.models import (
     Criterion,
     CriterionResult,
@@ -43,6 +45,14 @@ logger = logging.getLogger(__name__)
 
 _EXPLORATION_TOOLS = ["Read", "Grep", "Glob"]
 _MCP_TOOLS = ["mcp__reviewer__submit_finding", "mcp__reviewer__submit_review_verdict"]
+# Observed live (HomeMedicineCabinet PR #58, this action's own PR #12): the
+# system prompt's "do not go on an open-ended exploration" instruction is not
+# self-enforcing. A diff touching anything the rules file flags as sensitive
+# (there: a redaction rule) sent the model on an unbounded Read/Grep/Glob
+# chase — 20 calls across 15 turns, every one of them exploration, never once
+# converging on `submit_finding`/`submit_review_verdict`. Advice alone did not
+# stop it; this cap does, in `_make_repo_path_guard` below.
+_MAX_EXPLORATION_TOOL_CALLS = 8
 # Every mutation and egress tool the SDK ships, named explicitly. They are all
 # already absent from `allowed_tools`; listing them here too is the second half
 # of the defence in depth described in `_build_options`. `WebFetch` matters most
@@ -540,6 +550,13 @@ def _make_repo_path_guard(repo_root: Path) -> Any:
     environment and emitting it as a review finding. This hook is the boundary
     that stops it.
 
+    It also enforces `_MAX_EXPLORATION_TOOL_CALLS`: a per-run counter, closed
+    over below, of every Read/Grep/Glob call this hook sees (allowed or
+    denied — a rejected guess still spent a turn). Once exhausted, every
+    further exploration call is denied with a message telling the model to
+    judge from the diff instead, regardless of whether the path itself would
+    have been fine.
+
     Deliberately a hook rather than `can_use_tool`: `allowed_tools` lists the
     exploration tools by bare name, which auto-approves them *before* the
     permission callback is consulted (the SDK reports this as
@@ -555,11 +572,12 @@ def _make_repo_path_guard(repo_root: Path) -> Any:
         Any: A `HookCallback` suitable for a `HookMatcher`'s `hooks` list.
     """
     resolved_root = repo_root.resolve()
+    calls_made = 0
 
     async def guard(
         input_data: HookInput, tool_use_id: str | None, context: HookContext
     ) -> HookJSONOutput:
-        """Deny the call if any path argument resolves outside `repo_root`.
+        """Deny the call if the exploration budget is spent or a path escapes.
 
         Args:
             input_data: The PreToolUse payload, carrying `tool_name` and
@@ -569,8 +587,24 @@ def _make_repo_path_guard(repo_root: Path) -> Any:
 
         Returns:
             HookJSONOutput: An empty dict to let the call proceed, or a deny
-            decision naming the offending argument.
+            decision naming the offending argument or the spent budget.
         """
+        nonlocal calls_made
+        calls_made += 1
+        if calls_made > _MAX_EXPLORATION_TOOL_CALLS:
+            logger.warning(
+                "Exploration budget spent (%d Read/Grep/Glob calls); denying "
+                "further exploration for the rest of this run.",
+                calls_made,
+            )
+            return _deny(
+                f"Exploration budget spent: {_MAX_EXPLORATION_TOOL_CALLS} "
+                "Read/Grep/Glob calls already made this run. Stop exploring "
+                "the repository — judge from the diff you were given. Call "
+                "submit_finding for anything you are reasonably confident "
+                "about, then submit_review_verdict now."
+            )
+
         payload = cast(dict[str, Any], input_data)
         tool_input = payload.get("tool_input") or {}
         for arg_name in _PATH_ARG_NAMES:
@@ -611,7 +645,6 @@ def _build_options(
     repo_root: Path,
     model: str,
     max_turns: int,
-    allow_repo_exploration: bool,
     collector: _Collector,
     criteria: list[Criterion],
     changed_files: list[ChangedFile],
@@ -621,14 +654,9 @@ def _build_options(
     Args:
         system_prompt: The composed system prompt (role, criteria, rules,
             lessons, tool contracts).
-        repo_root: The consumer's checkout root, used as `cwd` so Read/Grep/
-            Glob (when allowed) browse the repository under review rather
-            than this action's own source.
+        repo_root: The consumer's checkout root, used as `cwd`.
         model: The model to run the review with.
         max_turns: The agent turn budget.
-        allow_repo_exploration: When False, Read/Grep/Glob are dropped from
-            `allowed_tools` (the repo-mismatch guard degrades to a diff-only
-            review rather than browsing the wrong codebase).
         collector: Mutable state the two tools append/store into.
         criteria: The loaded review criteria, for the verdict tool's
             exact-name validation.
@@ -649,14 +677,14 @@ def _build_options(
             _make_submit_verdict_tool(collector, criteria),
         ],
     )
+    # Read/Grep/Glob are never offered: a run given them reliably spends its
+    # entire turn budget on open-ended repository exploration and never
+    # reaches submit_finding/submit_review_verdict (observed live on
+    # HomeMedicineCabinet PR #58 and this action's own PR #12 — 0-to-1
+    # findings after up to 25 turns, every one of them Read/Grep/Glob). The
+    # system prompt's "don't over-explore" instruction was advice, not
+    # enforcement, and the model did not reliably follow it.
     allowed_tools = list(_MCP_TOOLS)
-    if allow_repo_exploration:
-        allowed_tools = [*_EXPLORATION_TOOLS, *allowed_tools]
-    else:
-        logger.warning(
-            "Repo exploration disabled for this run (Read/Grep/Glob withheld); "
-            "reviewing the diff only."
-        )
 
     return ClaudeAgentOptions(
         system_prompt=system_prompt,
@@ -673,9 +701,10 @@ def _build_options(
         # outside the `allowed_tools`/`disallowed_tools` lockdown entirely.
         setting_sources=[],
         strict_mcp_config=True,
-        # Registered unconditionally, including when exploration is disabled:
-        # if a future change re-adds a path-taking tool, the boundary is
-        # already in place rather than needing to be remembered.
+        # Registered even though Read/Grep/Glob are never in `allowed_tools`
+        # above: if a future change re-adds a path-taking tool, the boundary
+        # (and its exploration-budget cap) is already in place rather than
+        # needing to be remembered.
         hooks={
             "PreToolUse": [
                 HookMatcher(
@@ -729,6 +758,27 @@ def _build_user_prompt(
     return "\n".join(lines)
 
 
+_MAX_LOGGED_TOOL_INPUT_CHARS = 300
+
+
+def _render_tool_input(tool_input: dict[str, Any]) -> str:
+    """Render a tool call's input arguments for a single debug log line.
+
+    Args:
+        tool_input: The `ToolUseBlock.input` dict.
+
+    Returns:
+        str: A compact, length-capped rendering — turn-by-turn tool-call
+        logging exists to diagnose *which* tool ate the budget on a stuck
+        run, not to reproduce its full arguments (e.g. a `submit_finding`
+        comment can run long).
+    """
+    rendered = str(tool_input)
+    if len(rendered) > _MAX_LOGGED_TOOL_INPUT_CHARS:
+        rendered = rendered[:_MAX_LOGGED_TOOL_INPUT_CHARS] + "...(truncated)"
+    return rendered
+
+
 async def run_review(
     *,
     pr_metadata: PullRequestMetadata,
@@ -740,7 +790,6 @@ async def run_review(
     repo_root: Path,
     model: str,
     max_turns: int,
-    allow_repo_exploration: bool = True,
 ) -> ReviewRunResult:
     """Run the agentic review loop once and collect its findings and verdict.
 
@@ -757,7 +806,6 @@ async def run_review(
         repo_root: The consumer's checkout root, used as `cwd`.
         model: The model to run the review with.
         max_turns: The agent turn budget.
-        allow_repo_exploration: Whether Read/Grep/Glob are allowed this run.
 
     Returns:
         ReviewRunResult: The collected findings, verdict (if any), and
@@ -777,7 +825,6 @@ async def run_review(
         repo_root=repo_root,
         model=model,
         max_turns=max_turns,
-        allow_repo_exploration=allow_repo_exploration,
         collector=collector,
         criteria=criteria,
         changed_files=changed_files,
@@ -785,12 +832,29 @@ async def run_review(
     prompt = _build_user_prompt(pr_metadata, diff_context, was_truncated)
 
     sdk_success = False
+    turn = 0
     try:
         async for message in query(prompt=prompt, options=options):
             if isinstance(message, AssistantMessage):
+                # One AssistantMessage is one turn against `max_turns`, so
+                # this is the running count the final `num_turns` (only known
+                # at the very end, win or lose) cannot give you mid-run.
+                turn += 1
                 for block in message.content:
                     if isinstance(block, TextBlock):
-                        logger.debug("Assistant: %s", block.text)
+                        logger.debug("Turn %d — Assistant: %s", turn, block.text)
+                    elif isinstance(block, ToolUseBlock):
+                        # Turns are otherwise a black box in CI logs: text
+                        # commentary is the only other thing logged here, and
+                        # a turn spent purely on tool calls produces none. A
+                        # run that burns its whole budget without a single
+                        # finding is undiagnosable without this line.
+                        logger.debug(
+                            "Turn %d — Tool call: %s(%s)",
+                            turn,
+                            block.name,
+                            redact(_render_tool_input(block.input)),
+                        )
             elif isinstance(message, ResultMessage):
                 sdk_success = message.subtype == "success" and not message.is_error
                 logger.info(

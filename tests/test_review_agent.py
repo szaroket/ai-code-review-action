@@ -1,10 +1,12 @@
 """Unit tests for the pure, SDK-free parts of the agent loop."""
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
+from claude_agent_sdk import AssistantMessage, ToolUseBlock
 
 from pr_review_agent import review_agent
 from pr_review_agent.diff_parser import ChangedFile
@@ -166,13 +168,70 @@ def test_guard_does_not_treat_a_grep_regex_as_a_path(tmp_path: Path) -> None:
     assert _guard_decision(tmp_path, "Grep", pattern="/etc/passwd|../../secret") is None
 
 
-def _options(tmp_path: Path, *, allow_repo_exploration: bool = True) -> Any:
+def _call_guard(guard: Any, tool_name: str, **tool_input: Any) -> str | None:
+    """Invoke an already-built guard once; returns the decision, or None to allow."""
+    result = asyncio.run(
+        guard(
+            {  # pyright: ignore[reportArgumentType] - partial PreToolUse payload
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+            },
+            None,
+            None,  # pyright: ignore[reportArgumentType] - context is unused
+        )
+    )
+    specific = result.get("hookSpecificOutput")
+    if specific is None:
+        return None
+    return specific["permissionDecision"]
+
+
+def test_guard_allows_calls_up_to_the_exploration_budget(tmp_path: Path) -> None:
+    """A run genuinely needing a handful of targeted reads must not be cut short."""
+    (tmp_path / "src").mkdir()
+    guard = _make_repo_path_guard(tmp_path)
+    for _ in range(review_agent._MAX_EXPLORATION_TOOL_CALLS):
+        assert _call_guard(guard, "Read", file_path="src") is None
+
+
+def test_guard_denies_once_the_exploration_budget_is_spent(tmp_path: Path) -> None:
+    """Advice alone did not stop the model from exploring indefinitely; this must."""
+    (tmp_path / "src").mkdir()
+    guard = _make_repo_path_guard(tmp_path)
+    for _ in range(review_agent._MAX_EXPLORATION_TOOL_CALLS):
+        _call_guard(guard, "Read", file_path="src")
+
+    assert _call_guard(guard, "Read", file_path="src") == "deny"
+
+
+def test_guard_counts_a_denied_call_toward_the_budget_too(tmp_path: Path) -> None:
+    """A rejected out-of-repo guess still spent a turn; it must still count."""
+    guard = _make_repo_path_guard(tmp_path)
+    for _ in range(review_agent._MAX_EXPLORATION_TOOL_CALLS):
+        assert _call_guard(guard, "Read", file_path="/etc/passwd") == "deny"
+
+    result = asyncio.run(
+        guard(
+            {  # pyright: ignore[reportArgumentType] - partial PreToolUse payload
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/etc/passwd"},
+            },
+            None,
+            None,  # pyright: ignore[reportArgumentType] - context is unused
+        )
+    )
+    reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "budget" in reason.lower()
+
+
+def _options(tmp_path: Path) -> Any:
     return _build_options(
         system_prompt="review this",
         repo_root=tmp_path,
         model="claude-sonnet-5",
         max_turns=5,
-        allow_repo_exploration=allow_repo_exploration,
         collector=_Collector(),
         criteria=[],
         changed_files=[],
@@ -203,8 +262,12 @@ def test_mutation_and_egress_tools_are_disallowed(tmp_path: Path, tool: str) -> 
     assert tool not in options.allowed_tools
 
 
-def test_exploration_tools_are_dropped_on_a_repo_mismatch(tmp_path: Path) -> None:
-    options = _options(tmp_path, allow_repo_exploration=False)
+def test_exploration_tools_are_never_allowed(tmp_path: Path) -> None:
+    """A run given Read/Grep/Glob reliably burns its whole budget exploring.
+
+    It never reaches `submit_finding` — see `review_agent._build_options`.
+    """
+    options = _options(tmp_path)
     for tool in ("Read", "Grep", "Glob"):
         assert tool not in options.allowed_tools
 
@@ -251,10 +314,52 @@ def test_run_review_survives_a_mid_run_sdk_error(
             repo_root=tmp_path,
             model="claude-sonnet-5",
             max_turns=5,
-            allow_repo_exploration=False,
         )
     )
 
     assert result.sdk_success is False
     assert result.verdict is None
     assert result.findings == []
+
+
+def test_run_review_logs_each_tool_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stuck run must be diagnosable from CI logs: which tool, how often.
+
+    Before this, `run_review` only logged assistant text and blocked paths —
+    a turn spent purely on tool calls (the common case for a run that never
+    reaches `submit_finding`) left no trace at all.
+    """
+
+    async def _one_tool_call(*, prompt: str, options: object) -> Any:
+        yield AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="tool_1", name="Read", input={"file_path": "backend/app/main.py"}
+                )
+            ],
+            model="claude-sonnet-5",
+        )
+
+    monkeypatch.setattr(review_agent, "query", _one_tool_call)
+
+    with caplog.at_level(logging.DEBUG, logger="pr_review_agent"):
+        asyncio.run(
+            run_review(
+                pr_metadata=_pr_metadata(),
+                diff_context="diff --git a/x b/x\n",
+                was_truncated=False,
+                system_prompt="be a reviewer",
+                criteria=[],
+                changed_files=[],
+                repo_root=tmp_path,
+                model="claude-sonnet-5",
+                max_turns=5,
+            )
+        )
+
+    assert any(
+        "Tool call: Read" in record.message and "backend/app/main.py" in record.message
+        for record in caplog.records
+    )

@@ -183,7 +183,6 @@ def happy_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "get_pr_metadata", lambda pr, repo: _metadata())
     monkeypatch.setattr(cli, "get_pr_diff", lambda pr, repo: _DIFF)
     monkeypatch.setattr(cli, "find_repo_root", lambda: tmp_path)
-    monkeypatch.setattr(cli, "_allow_repo_exploration", lambda resolved, root: False)
     monkeypatch.setattr(cli, "get_file_at_ref", lambda path, ref, repo: criteria_text)
 
     async def _run(**kwargs: object) -> ReviewRunResult:

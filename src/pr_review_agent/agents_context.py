@@ -25,10 +25,10 @@ _ROLE_STATEMENT = (
 )
 
 _TOOL_USAGE_GUIDANCE = (
-    "You may use the Read, Grep, and Glob tools to look at repository files "
-    "for context, but only to understand code strictly around the changed "
-    "lines (e.g. a function's callers, a type's definition). Do not go on an "
-    "open-ended exploration of the repository."
+    "You have no Read, Grep, or Glob tools — there is no way to browse the "
+    "repository. Review the diff below exactly as given; judge each change "
+    "from the diff context alone rather than waiting to confirm it against "
+    "the wider codebase."
 )
 
 _SUBMIT_FINDING_CONTRACT = (
