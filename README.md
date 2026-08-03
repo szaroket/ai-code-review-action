@@ -76,8 +76,10 @@ jobs:
 ```
 
 `actions/checkout` is required: the action resolves `criteria-file`,
-`rules-file` and `lessons-file` relative to the checkout, and uses it to decide
-whether the agent may explore the repository at all.
+`rules-file` and `lessons-file` relative to the checkout. The agent reviews
+the diff only — it has no Read/Grep/Glob access to browse the repository;
+an earlier version offered it, but a run given the tools reliably spent its
+entire turn budget exploring and never submitted a finding.
 
 ## Inputs
 

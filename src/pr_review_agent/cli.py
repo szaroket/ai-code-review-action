@@ -37,7 +37,6 @@ from pr_review_agent.github_diff import (
     get_file_at_ref,
     get_pr_diff,
     get_pr_metadata,
-    origin_repo,
     resolve_repo,
 )
 from pr_review_agent.github_publish import GitHubPublishError, post_review
@@ -128,40 +127,6 @@ def filter_in_scope_files(
             for prefix in prefixes
         )
     ]
-
-
-def _allow_repo_exploration(resolved_repo: tuple[str, str], repo_root: Path) -> bool:
-    """Decide whether Read/Grep/Glob should be enabled for this run.
-
-    The diff is fetched for `resolved_repo`, but `repo_root` is whatever local
-    checkout the process happens to be running in. When the two diverge — or
-    the local `origin` can't be determined at all — repo-exploration tools
-    would silently browse a different codebase than the one under review, so
-    exploration is disabled and a loud warning is logged instead.
-
-    Args:
-        resolved_repo: The `(owner, name)` the diff/metadata were fetched for.
-        repo_root: The local checkout root that would be used as `cwd`.
-
-    Returns:
-        bool: True when the local checkout's `origin` remote matches
-        `resolved_repo`.
-    """
-    local_origin = origin_repo(cwd=repo_root)
-    if local_origin == resolved_repo:
-        return True
-
-    local_label = (
-        f"{local_origin[0]}/{local_origin[1]}" if local_origin else "undeterminable"
-    )
-    logger.warning(
-        "Repo exploration disabled: reviewing %s/%s but the local checkout's "
-        "origin is %s. Read/Grep/Glob will not be available for this run.",
-        resolved_repo[0],
-        resolved_repo[1],
-        local_label,
-    )
-    return False
 
 
 def _repo_relative(path: Path, repo_root: Path) -> str | None:
@@ -555,7 +520,6 @@ async def main_async(args: argparse.Namespace) -> int:
 
     diff_context, was_truncated = build_diff_context(in_scope, _MAX_DIFF_CONTEXT_CHARS)
     system_prompt = build_system_prompt(rules_content, lessons_content, criteria)
-    allow_repo_exploration = _allow_repo_exploration((owner, name), repo_root)
 
     try:
         result = await run_review(
@@ -568,7 +532,6 @@ async def main_async(args: argparse.Namespace) -> int:
             repo_root=repo_root,
             model=args.model,
             max_turns=args.max_turns,
-            allow_repo_exploration=allow_repo_exploration,
         )
     except ClaudeSDKError as exc:
         logger.error("%s", exc)

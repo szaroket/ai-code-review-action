@@ -592,6 +592,11 @@ def _make_repo_path_guard(repo_root: Path) -> Any:
         nonlocal calls_made
         calls_made += 1
         if calls_made > _MAX_EXPLORATION_TOOL_CALLS:
+            logger.warning(
+                "Exploration budget spent (%d Read/Grep/Glob calls); denying "
+                "further exploration for the rest of this run.",
+                calls_made,
+            )
             return _deny(
                 f"Exploration budget spent: {_MAX_EXPLORATION_TOOL_CALLS} "
                 "Read/Grep/Glob calls already made this run. Stop exploring "
@@ -640,7 +645,6 @@ def _build_options(
     repo_root: Path,
     model: str,
     max_turns: int,
-    allow_repo_exploration: bool,
     collector: _Collector,
     criteria: list[Criterion],
     changed_files: list[ChangedFile],
@@ -650,14 +654,9 @@ def _build_options(
     Args:
         system_prompt: The composed system prompt (role, criteria, rules,
             lessons, tool contracts).
-        repo_root: The consumer's checkout root, used as `cwd` so Read/Grep/
-            Glob (when allowed) browse the repository under review rather
-            than this action's own source.
+        repo_root: The consumer's checkout root, used as `cwd`.
         model: The model to run the review with.
         max_turns: The agent turn budget.
-        allow_repo_exploration: When False, Read/Grep/Glob are dropped from
-            `allowed_tools` (the repo-mismatch guard degrades to a diff-only
-            review rather than browsing the wrong codebase).
         collector: Mutable state the two tools append/store into.
         criteria: The loaded review criteria, for the verdict tool's
             exact-name validation.
@@ -678,14 +677,14 @@ def _build_options(
             _make_submit_verdict_tool(collector, criteria),
         ],
     )
+    # Read/Grep/Glob are never offered: a run given them reliably spends its
+    # entire turn budget on open-ended repository exploration and never
+    # reaches submit_finding/submit_review_verdict (observed live on
+    # HomeMedicineCabinet PR #58 and this action's own PR #12 — 0-to-1
+    # findings after up to 25 turns, every one of them Read/Grep/Glob). The
+    # system prompt's "don't over-explore" instruction was advice, not
+    # enforcement, and the model did not reliably follow it.
     allowed_tools = list(_MCP_TOOLS)
-    if allow_repo_exploration:
-        allowed_tools = [*_EXPLORATION_TOOLS, *allowed_tools]
-    else:
-        logger.warning(
-            "Repo exploration disabled for this run (Read/Grep/Glob withheld); "
-            "reviewing the diff only."
-        )
 
     return ClaudeAgentOptions(
         system_prompt=system_prompt,
@@ -702,9 +701,10 @@ def _build_options(
         # outside the `allowed_tools`/`disallowed_tools` lockdown entirely.
         setting_sources=[],
         strict_mcp_config=True,
-        # Registered unconditionally, including when exploration is disabled:
-        # if a future change re-adds a path-taking tool, the boundary is
-        # already in place rather than needing to be remembered.
+        # Registered even though Read/Grep/Glob are never in `allowed_tools`
+        # above: if a future change re-adds a path-taking tool, the boundary
+        # (and its exploration-budget cap) is already in place rather than
+        # needing to be remembered.
         hooks={
             "PreToolUse": [
                 HookMatcher(
@@ -790,7 +790,6 @@ async def run_review(
     repo_root: Path,
     model: str,
     max_turns: int,
-    allow_repo_exploration: bool = True,
 ) -> ReviewRunResult:
     """Run the agentic review loop once and collect its findings and verdict.
 
@@ -807,7 +806,6 @@ async def run_review(
         repo_root: The consumer's checkout root, used as `cwd`.
         model: The model to run the review with.
         max_turns: The agent turn budget.
-        allow_repo_exploration: Whether Read/Grep/Glob are allowed this run.
 
     Returns:
         ReviewRunResult: The collected findings, verdict (if any), and
@@ -827,7 +825,6 @@ async def run_review(
         repo_root=repo_root,
         model=model,
         max_turns=max_turns,
-        allow_repo_exploration=allow_repo_exploration,
         collector=collector,
         criteria=criteria,
         changed_files=changed_files,
@@ -835,12 +832,17 @@ async def run_review(
     prompt = _build_user_prompt(pr_metadata, diff_context, was_truncated)
 
     sdk_success = False
+    turn = 0
     try:
         async for message in query(prompt=prompt, options=options):
             if isinstance(message, AssistantMessage):
+                # One AssistantMessage is one turn against `max_turns`, so
+                # this is the running count the final `num_turns` (only known
+                # at the very end, win or lose) cannot give you mid-run.
+                turn += 1
                 for block in message.content:
                     if isinstance(block, TextBlock):
-                        logger.debug("Assistant: %s", block.text)
+                        logger.debug("Turn %d — Assistant: %s", turn, block.text)
                     elif isinstance(block, ToolUseBlock):
                         # Turns are otherwise a black box in CI logs: text
                         # commentary is the only other thing logged here, and
@@ -848,7 +850,8 @@ async def run_review(
                         # run that burns its whole budget without a single
                         # finding is undiagnosable without this line.
                         logger.debug(
-                            "Tool call: %s(%s)",
+                            "Turn %d — Tool call: %s(%s)",
+                            turn,
                             block.name,
                             redact(_render_tool_input(block.input)),
                         )

@@ -226,13 +226,12 @@ def test_guard_counts_a_denied_call_toward_the_budget_too(tmp_path: Path) -> Non
     assert "budget" in reason.lower()
 
 
-def _options(tmp_path: Path, *, allow_repo_exploration: bool = True) -> Any:
+def _options(tmp_path: Path) -> Any:
     return _build_options(
         system_prompt="review this",
         repo_root=tmp_path,
         model="claude-sonnet-5",
         max_turns=5,
-        allow_repo_exploration=allow_repo_exploration,
         collector=_Collector(),
         criteria=[],
         changed_files=[],
@@ -263,8 +262,12 @@ def test_mutation_and_egress_tools_are_disallowed(tmp_path: Path, tool: str) -> 
     assert tool not in options.allowed_tools
 
 
-def test_exploration_tools_are_dropped_on_a_repo_mismatch(tmp_path: Path) -> None:
-    options = _options(tmp_path, allow_repo_exploration=False)
+def test_exploration_tools_are_never_allowed(tmp_path: Path) -> None:
+    """A run given Read/Grep/Glob reliably burns its whole budget exploring.
+
+    It never reaches `submit_finding` — see `review_agent._build_options`.
+    """
+    options = _options(tmp_path)
     for tool in ("Read", "Grep", "Glob"):
         assert tool not in options.allowed_tools
 
@@ -311,7 +314,6 @@ def test_run_review_survives_a_mid_run_sdk_error(
             repo_root=tmp_path,
             model="claude-sonnet-5",
             max_turns=5,
-            allow_repo_exploration=False,
         )
     )
 
@@ -354,7 +356,6 @@ def test_run_review_logs_each_tool_call(
                 repo_root=tmp_path,
                 model="claude-sonnet-5",
                 max_turns=5,
-                allow_repo_exploration=False,
             )
         )
 
